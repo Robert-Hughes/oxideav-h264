@@ -73,6 +73,9 @@ pub mod transform;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod vui;
 
+pub mod access_unit;
+pub mod picture_frontend;
+
 pub mod h264_decoder;
 
 pub mod h264_encoder;
