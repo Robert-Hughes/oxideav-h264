@@ -188,6 +188,58 @@ Clone that repo next to your `oxideav` checkout if you're an internal
 contributor; otherwise the document is freely downloadable from
 https://www.itu.int/rec/T-REC-H.264 (pick the 2024-08 edition).
 
+## Streaming frontend architecture
+
+H.264 transport packet boundaries are not necessarily NAL or access-unit
+boundaries. MPEG-TS is the motivating real-world example: the demuxer emits PES
+payloads, and a PES can start with continuation bytes from the previous H.264
+NAL/picture before a new access unit begins. At the same time, not every decoder
+wants the framework to pre-parse the stream — NVIDIA NVDEC's `cuvidParser`, for
+example, is itself a stateful H.264 stream parser.
+
+The crate therefore exposes **opt-in**, composable preprocessing rather than a
+mandatory decoder pipeline:
+
+```text
+A. raw byte packets
+   → decoder owns incremental stream parsing
+   → example: NVDEC / cuvidParser
+
+B. complete Annex-B access units
+   → AnnexBAccessUnitAssembler owns cross-packet/PES reconstruction
+   → decoder still owns picture parsing/state
+
+C. parsed/derived pictures
+   → H264PictureFrontend owns POC + reference DPB + MMCO/frame_num-gap state
+   → backend owns pixel/hardware reconstruction
+```
+
+`access_unit::AnnexBAccessUnitAssembler` preserves the timestamp of the packet
+in which an AUD-delimited access unit begins, appends leading continuation bytes
+to the preceding unit, and can split multiple access units from one PES without
+inventing timestamps for later units. AUD is not mandatory in H.264, so an
+otherwise packet-aligned Annex-B stream keeps a pass-through fallback; the
+helper is not intended to replace a fully syntax-driven parser for every
+possible transport.
+
+`picture_frontend::H264PictureFrontend` is likewise optional. Hardware APIs such
+as VDPAU need the application to supply POC/reference-picture/MMCO state, while
+other APIs already derive it internally. The frontend is **transactional**:
+`prepare_*` simulates the cross-picture state and `commit()` advances it only
+after reconstruction succeeds. Opaque DPB keys let software decoders map live
+references to reconstructed sample buffers while hardware backends map the same
+metadata to surfaces.
+
+The pure-Rust decoder deliberately uses `prepare_parsed_picture()` rather than
+the frontend's simpler Annex-B parser. That preserves its richer slice handling
+(PAFF/MBAFF, data partitioning, separate colour planes, etc.) while removing its
+previous duplicate POC/DPB/MMCO/frame-gap state machine. The VDPAU backend opts
+into both the access-unit assembler and the parsed-picture frontend.
+
+This architecture was validated on a Twitch HLS MPEG-TS stream whose PES
+boundaries split H.264 access units: both the software decoder and VDPAU path
+produce the same 600-frame output hashes as before the refactor.
+
 ## Specification coverage
 
 | Spec area | Clause | Status |
