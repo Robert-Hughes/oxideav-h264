@@ -42,7 +42,9 @@ impl AnnexBAccessUnitAssembler {
                 pending.data.extend_from_slice(&packet.data);
                 return Ok(Vec::new());
             }
-            if starts_with_annex_b(&packet.data) {
+            if contains_annex_b_start_code(&packet.data) {
+                // Preserve the parser's long-standing ability to resynchronise
+                // past leading garbage/prefix bytes before the first NAL.
                 return Ok(vec![packet.clone()]);
             }
             return Err(Error::unsupported(
@@ -109,6 +111,10 @@ impl AnnexBAccessUnitAssembler {
 #[must_use]
 pub fn starts_with_annex_b(data: &[u8]) -> bool {
     data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1])
+}
+
+fn contains_annex_b_start_code(data: &[u8]) -> bool {
+    data.windows(3).any(|w| w == [0, 0, 1])
 }
 
 /// Byte offsets of Annex-B Access Unit Delimiter NAL start-code prefixes.
@@ -201,6 +207,16 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].data, data);
         assert!(!a.has_pending());
+    }
+
+    #[test]
+    fn leading_junk_before_annex_b_start_code_remains_parser_resynchronisable() {
+        let data = [0xaa, 0xbb, 0xcc, 0, 0, 1, 0x65, 0x11];
+        let mut a = AnnexBAccessUnitAssembler::default();
+        let out = a.push(&packet(12, &data)).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].data, data);
+        assert_eq!(out[0].pts, Some(12));
     }
 
     #[test]

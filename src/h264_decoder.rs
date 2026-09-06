@@ -50,16 +50,16 @@ use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase, VideoFrame, VideoPlane,
 };
 
+use crate::access_unit::AnnexBAccessUnitAssembler;
 use crate::decoder::{Decoder as H264Driver, Event};
 use crate::dpb_output::{DpbOutput, OutputEntry};
 use crate::mb_grid::MbGrid;
 use crate::picture::Picture;
-use crate::poc::{derive_poc, PocResult, PocSlice, PocSps, PocState};
-use crate::ref_list::{self, DpbEntry, MmcoOp as RefMmcoOp, PicStructure, RefMarking, RplmOp};
+use crate::picture_frontend::{H264PictureFrontend, PreparedH264Picture};
+use crate::poc::PocResult;
+use crate::ref_list::{self, DpbEntry, PicStructure, RplmOp};
 use crate::ref_store::{RefPicProvider, RefPicStore};
-use crate::slice_header::{
-    MmcoOp as SliceMmcoOp, RefPicListModificationOp as SliceRplmOp, SliceHeader, SliceType,
-};
+use crate::slice_header::{RefPicListModificationOp as SliceRplmOp, SliceHeader, SliceType};
 use crate::sps::Sps;
 use crate::{reconstruct, slice_data};
 
@@ -75,6 +75,8 @@ use crate::{reconstruct, slice_data};
 /// picture is finalized (pushed into the DPB and output queue) and a
 /// fresh one is started from the triggering slice.
 struct PictureInProgress {
+    /// Shared cross-picture state prepared transactionally from the first slice.
+    prepared: PreparedH264Picture,
     /// Reconstructed samples.
     pic: Picture,
     /// MB metadata for the assembled picture. Carries §6.4.11 availability
@@ -266,42 +268,17 @@ pub struct H264CodecDecoder {
     /// Packet time_base so downstream consumers can rescale.
     pending_time_base: TimeBase,
 
-    // ---- DPB / cross-picture state (§8.2.1 / §8.2.4 / §8.2.5) -------
-    /// Long-lived decoded picture store. Holds reconstructed Pictures
-    /// by DPB slot key. The per-slice ref_pic_list_0 / _1 arrays are
-    /// repopulated for every slice via `set_list_0` / `set_list_1`.
+    /// Long-lived reconstructed sample store keyed by shared DPB keys.
     ref_store: RefPicStore,
-    /// DPB entry metadata (marking, POC, frame_num, …) in decode
-    /// order. Parallel to the keys held in `ref_store`. §8.2.4 /
-    /// §8.2.5 state-machine ops live on this vector.
-    dpb_entries: Vec<DpbEntry>,
-    /// §8.2.1 POC derivation state (prev_pic_order_cnt_msb, etc.).
-    poc_state: PocState,
-    /// Monotonic counter used to mint fresh DPB slot keys. Never
-    /// reused within a stream so `RefPicStore` keys never alias — if
-    /// this wraps we recycle (stream length in the billions of frames
-    /// is not something we need to worry about). Store memory stays
-    /// bounded despite the monotonic keys because every marking pass
-    /// prunes pictures whose keys left `dpb_entries`
-    /// (`prune_ref_store`).
-    next_dpb_key: u32,
-    /// Set when the previous *reference* picture's
-    /// `dec_ref_pic_marking()` contained MMCO-5. Consumed by the next
-    /// call to `derive_poc`. §8.2.1 NOTE 1.
-    prev_had_mmco5: bool,
-    /// For the §8.2.1.1 MMCO-5 hint — the previous reference
-    /// picture's `TopFieldOrderCnt`, used only when `prev_had_mmco5`.
-    prev_reference_top_foc: i32,
-    /// §8.2.5.2 — `PrevRefFrameNum` kept for the gap-in-frame_num
-    /// detection / non-existing reference-frame synthesis. Holds the
-    /// `frame_num` of the most recent *reference* picture decoded in
-    /// the current coded video sequence. Reset on IDR.
-    ///
-    /// When the next picture arrives with `frame_num` not equal to
-    /// `(prev_ref_frame_num + 1) mod MaxFrameNum`, the spec §8.2.5.2
-    /// procedure inserts synthetic "non-existing" short-term reference
-    /// frames for each missing `frame_num` value.
-    prev_ref_frame_num: Option<u32>,
+
+    // ---- Shared H.264 byte/picture frontend --------------------------
+    /// Optional Annex-B access-unit packetiser. AVCC retains its native
+    /// length-prefixed packet path; Annex-B uses this helper so PES/container
+    /// packet boundaries do not have to coincide with NAL/AU boundaries.
+    au_assembler: AnnexBAccessUnitAssembler,
+    /// Shared POC / DPB / MMCO / frame_num-gap state. Pixel samples remain in
+    /// `ref_store`; this frontend owns only codec metadata and opaque keys.
+    picture_frontend: H264PictureFrontend,
 
     /// §7.4.1.2 / §7.4.1.2.4 — picture currently being assembled across
     /// one-or-more slice NAL units. `None` means no slice of the current
@@ -365,12 +342,8 @@ impl H264CodecDecoder {
             pending_dp: None,
             pending_time_base: TimeBase::new(1, 1),
             ref_store: RefPicStore::new(),
-            dpb_entries: Vec::new(),
-            poc_state: PocState::default(),
-            next_dpb_key: 0,
-            prev_had_mmco5: false,
-            prev_reference_top_foc: 0,
-            prev_ref_frame_num: None,
+            au_assembler: AnnexBAccessUnitAssembler::default(),
+            picture_frontend: H264PictureFrontend::new(),
             in_progress: None,
             pending_field: None,
             scp: None,
@@ -1074,54 +1047,35 @@ impl H264CodecDecoder {
                 )));
             }
 
-            // §7.4.3 — frame_num discipline. When
-            // `gaps_in_frame_num_value_allowed_flag` is 0 and the
-            // current picture's `frame_num` differs from
-            // `PrevRefFrameNum`, conformance requires `frame_num ==
-            // (PrevRefFrameNum + 1) % MaxFrameNum` exactly. (Equality
-            // with `PrevRefFrameNum` itself is the
-            // second-field / non-reference-following-reference case and
-            // is checked by the §7.4.1.2.4 picture-boundary logic.)
-            if !is_idr && !sps.gaps_in_frame_num_value_allowed_flag {
-                if let Some(prev) = self.prev_ref_frame_num {
-                    let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
-                    let expected = (prev + 1) % max_frame_num;
-                    if header.frame_num != prev && header.frame_num != expected {
-                        return Err(Error::invalid(format!(
-                            "h264 slice_header: frame_num {} after PrevRefFrameNum {} (§7.4.3 requires {} when gaps_in_frame_num_value_allowed_flag is 0)",
-                            header.frame_num, prev, expected
-                        )));
-                    }
+            // Shared §7.4.3/§8.2.1/§8.2.5 preparation: validates frame_num
+            // discipline, simulates allowed non-existing references, derives
+            // POC and snapshots the DPB that this picture must decode against.
+            let prepared = self.picture_frontend.prepare_parsed_picture(
+                nal_unit_type,
+                nal_ref_idc,
+                header.clone(),
+                sps.clone(),
+                pps.clone(),
+                1,
+            )?;
+            let poc = prepared.poc;
+            let structure = prepared.structure;
+
+            // §8.2.5.2 synthetic references carry metadata in the shared
+            // frontend. The software backend supplies neutral sample buffers
+            // for their opaque keys; conforming streams never sample them.
+            if !prepared.synthetic_references.is_empty() {
+                let gray = gray_picture(
+                    sps.pic_width_in_mbs() * 16,
+                    sps.frame_height_in_mbs() * 16,
+                    sps.chroma_array_type(),
+                    sps.bit_depth_luma_minus8 + 8,
+                    sps.bit_depth_chroma_minus8 + 8,
+                );
+                for entry in &prepared.synthetic_references {
+                    self.ref_store.insert(entry.dpb_key, gray.clone());
                 }
             }
-
-            // §8.2.5.2 — gaps in frame_num. When the stream signals a
-            // gap (`frame_num != (PrevRefFrameNum + 1) mod MaxFrameNum`)
-            // and the SPS allows gaps, synthesize "non-existing" short-term
-            // reference frames for each missing value to keep the
-            // sliding window + RPLM picNumX arithmetic aligned with the
-            // encoder's view of the DPB.
-            if !is_idr && sps.gaps_in_frame_num_value_allowed_flag {
-                self.fill_frame_num_gap(&sps, header.frame_num)?;
-            }
-
-            // §8.2.1 — derive POC for this picture. All slices of the
-            // same picture will share this value (§7.4.1.2.4).
-            let poc_sps = make_poc_sps(&sps);
-            let poc_slice = PocSlice {
-                is_reference,
-                is_idr,
-                frame_num: header.frame_num,
-                field_pic_flag: header.field_pic_flag,
-                bottom_field_flag: header.bottom_field_flag,
-                pic_order_cnt_lsb: header.pic_order_cnt_lsb,
-                delta_pic_order_cnt_bottom: header.delta_pic_order_cnt_bottom,
-                delta_pic_order_cnt: header.delta_pic_order_cnt,
-                prev_had_mmco5: self.prev_had_mmco5,
-                prev_reference_top_foc_for_mmco5: self.prev_reference_top_foc,
-            };
-            let poc = derive_poc(&poc_sps, &poc_slice, &mut self.poc_state)
-                .map_err(|e| Error::invalid(format!("h264 POC: {e:?}")))?;
 
             // §7.4.2.1.1 eq. (7-26) — a PAFF field picture
             // (`field_pic_flag == 1`) is decoded as a half-height picture
@@ -1141,8 +1095,6 @@ impl H264CodecDecoder {
                 sps.bit_depth_chroma_minus8 + 8,
             );
             let grid = MbGrid::new(sps.pic_width_in_mbs(), pic_height_in_mbs);
-            let structure =
-                pic_structure_from_flags(header.field_pic_flag, header.bottom_field_flag);
 
             // Consume the packet-level pts exactly once per access unit
             // — the first slice to open a picture gets it.
@@ -1156,6 +1108,7 @@ impl H264CodecDecoder {
             let mb_field_flags = vec![false; mb_count];
 
             self.in_progress = Some(PictureInProgress {
+                prepared,
                 pic,
                 grid,
                 first_nal_unit_type: nal_unit_type,
@@ -1228,6 +1181,13 @@ impl H264CodecDecoder {
         }
         .map_err(|e| Error::invalid(format!("h264 slice_data: {e}")))?;
 
+        let prepared_references = self
+            .in_progress
+            .as_ref()
+            .expect("in_progress must have been seeded by handle_slice")
+            .prepared
+            .references
+            .clone();
         let in_progress = self
             .in_progress
             .as_mut()
@@ -1279,7 +1239,7 @@ impl H264CodecDecoder {
             let (mut fl0, mut fl1) = match header.slice_type {
                 SliceType::P | SliceType::SP => (
                     ref_list::init_ref_pic_list_p_field(
-                        &self.dpb_entries,
+                        &prepared_references,
                         header.frame_num,
                         max_frame_num,
                         current_bottom,
@@ -1287,7 +1247,7 @@ impl H264CodecDecoder {
                     Vec::new(),
                 ),
                 SliceType::B => ref_list::init_ref_pic_lists_b_field(
-                    &self.dpb_entries,
+                    &prepared_references,
                     pic_order_cnt,
                     current_bottom,
                 ),
@@ -1311,7 +1271,7 @@ impl H264CodecDecoder {
                 ref_list::modify_ref_pic_list_field(
                     &mut fl0,
                     &ops_l0,
-                    &self.dpb_entries,
+                    &prepared_references,
                     header.num_ref_idx_l0_active_minus1 + 1,
                     header.frame_num,
                     max_frame_num,
@@ -1328,15 +1288,15 @@ impl H264CodecDecoder {
                 ref_list::modify_ref_pic_list_field(
                     &mut fl1,
                     &ops_l1,
-                    &self.dpb_entries,
+                    &prepared_references,
                     header.num_ref_idx_l1_active_minus1 + 1,
                     header.frame_num,
                     max_frame_num,
                     current_bottom,
                 );
             }
-            let r0 = Self::resolve_field_list(&self.dpb_entries, &self.ref_store, &fl0);
-            let r1 = Self::resolve_field_list(&self.dpb_entries, &self.ref_store, &fl1);
+            let r0 = Self::resolve_field_list(&prepared_references, &self.ref_store, &fl0);
+            let r1 = Self::resolve_field_list(&prepared_references, &self.ref_store, &fl1);
             l0_overrides = r0.overrides;
             l1_overrides = r1.overrides;
             l0_parities = r0.parities;
@@ -1358,7 +1318,7 @@ impl H264CodecDecoder {
             // reference frames and complementary reference field
             // PAIRS (two stored coded-field entries collapse into one
             // unit; non-paired reference fields are excluded).
-            let (frame_units, pairings) = ref_list::collapse_field_pairs(&self.dpb_entries);
+            let (frame_units, pairings) = ref_list::collapse_field_pairs(&prepared_references);
             let (mut l0, mut l1) = match header.slice_type {
                 SliceType::P | SliceType::SP => (
                     ref_list::init_ref_pic_list_p(
@@ -1549,7 +1509,7 @@ impl H264CodecDecoder {
                 let list_0_longterm: Vec<bool> = list0
                     .iter()
                     .map(|&key| {
-                        self.dpb_entries
+                        prepared_references
                             .iter()
                             .find(|e| e.dpb_key == key)
                             .map(|e| e.is_long_term())
@@ -1568,7 +1528,7 @@ impl H264CodecDecoder {
                 let list_1_longterm: Vec<bool> = list1
                     .iter()
                     .map(|&key| {
-                        self.dpb_entries
+                        prepared_references
                             .iter()
                             .find(|e| e.dpb_key == key)
                             .map(|e| e.is_long_term())
@@ -1767,6 +1727,13 @@ impl H264CodecDecoder {
         // fuzz oracle on `crash-2ad9589f…` (3 non-IDR slices, all
         // fail "CABAC read past end of bitstream").
         if !in_progress.any_slice_succeeded {
+            let live: Vec<u32> = self
+                .picture_frontend
+                .references()
+                .iter()
+                .map(|e| e.dpb_key)
+                .collect();
+            self.ref_store.retain_keys(&live);
             return Ok(());
         }
         // §7.4.2.1 / Annex A — a coded picture must cover every
@@ -1788,18 +1755,26 @@ impl H264CodecDecoder {
         // slice — total coverage ≪ PicSizeInMbs, leaving most of the
         // luma + chroma planes zero on output.
         if in_progress.grid.info.iter().any(|m| !m.available) {
+            let live: Vec<u32> = self
+                .picture_frontend
+                .references()
+                .iter()
+                .map(|e| e.dpb_key)
+                .collect();
+            self.ref_store.retain_keys(&live);
             return Ok(());
         }
         let PictureInProgress {
+            prepared,
             mut pic,
             grid,
             first_nal_unit_type: _,
             first_nal_ref_idc: _,
             first_header,
-            is_reference,
+            is_reference: _,
             is_idr,
             poc,
-            structure,
+            structure: _,
             pts,
             time_base,
             deblock_enabled,
@@ -1851,110 +1826,28 @@ impl H264CodecDecoder {
             );
         }
 
-        // §8.2.5 — decoded reference picture marking.
-        let mut current_entry = DpbEntry {
-            frame_num: first_header.frame_num,
-            top_field_order_cnt: poc.top_field_order_cnt,
-            bottom_field_order_cnt: poc.bottom_field_order_cnt,
-            pic_order_cnt: poc.pic_order_cnt,
-            structure,
-            marking: if is_reference {
-                RefMarking::ShortTerm
-            } else {
-                RefMarking::Unused
-            },
-            long_term_frame_idx: 0,
-            dpb_key: self.mint_dpb_key(),
-            field_markings: [RefMarking::Unused; 2],
-        };
-        current_entry.sync_field_markings();
-
-        let mut mmco5_triggered = false;
-        if is_reference {
-            let marking = first_header.dec_ref_pic_marking.as_ref();
-            let long_term_ref_flag = marking.is_some_and(|m| m.long_term_reference_flag);
-            let no_output = marking.is_some_and(|m| m.no_output_of_prior_pics_flag);
-            let adaptive_ops_vec: Option<Vec<RefMmcoOp>> = marking
-                .and_then(|m| m.adaptive_marking.as_ref())
-                .map(|ops| ops.iter().map(slice_mmco_to_ref_mmco).collect());
-
-            mmco5_triggered = ref_list::perform_marking(
-                &mut self.dpb_entries,
-                &mut current_entry,
-                sps.max_num_ref_frames,
-                is_idr,
-                long_term_ref_flag,
-                no_output,
-                adaptive_ops_vec.as_deref(),
-                first_header.frame_num,
-                1u32 << (sps.log2_max_frame_num_minus4 + 4),
-            );
-
-            // §8.2.5.4 field forms can leave one field of an entry
-            // referenced while the frame-level marking dropped — keep
-            // the entry while ANY field is still a reference.
-            self.dpb_entries.retain(|e| e.is_any_field_ref());
-
-            // §7.4.1.2.4 / §8.2.1 NOTE 1 — when the current picture
-            // carries MMCO 5, its frame_num is inferred to 0 and its
-            // Top/BottomFieldOrderCnt (hence PicOrderCnt) are reset
-            // to post-subtraction values for *all* subsequent uses —
-            // reference-picture-list construction included. Store the
-            // post-reset values in the DPB so §8.2.4.1 PicNum /
-            // FrameNumWrap arithmetic on later slices sees the
-            // spec-sanctioned zeroed identity. The same reset must be
-            // applied to the Picture that is inserted into `ref_store`
-            // so that downstream POC-based queries (ref_pic_poc /
-            // weighted bipred / temporal-direct) see the post-reset
-            // identity too — otherwise later slices referencing this
-            // picture compare against its pre-reset POC and mis-identify
-            // picture identity at deblock-time.
+        // §8.2.5 / §8.2.1 cross-picture state is committed by the shared
+        // frontend only after reconstruction and deblocking succeeded. The
+        // software backend owns only the reconstructed sample buffers keyed by
+        // the frontend's opaque DPB ids.
+        let commit = self.picture_frontend.commit(prepared);
+        let mmco5_triggered = commit.mmco5;
+        if let Some(entry) = commit.current_dpb_entry.as_ref() {
             if mmco5_triggered {
-                let temp = current_entry.pic_order_cnt;
-                current_entry.frame_num = 0;
-                current_entry.top_field_order_cnt -= temp;
-                current_entry.bottom_field_order_cnt -= temp;
-                current_entry.pic_order_cnt = current_entry
-                    .top_field_order_cnt
-                    .min(current_entry.bottom_field_order_cnt);
-                pic.pic_order_cnt = current_entry.pic_order_cnt;
-                pic.frame_num = 0;
+                // Keep the stored Picture's identity aligned with the
+                // frontend's post-MMCO5 DPB descriptor.
+                pic.pic_order_cnt = entry.pic_order_cnt;
+                pic.frame_num = entry.frame_num;
             }
-
-            self.ref_store.insert(current_entry.dpb_key, pic.clone());
-            self.dpb_entries.push(current_entry);
-            // §8.2.5 — pictures the marking pass just evicted can never
-            // be referenced again; release their samples so store
-            // memory stays bounded by the DPB size (round 430: the
-            // store previously retained every reference picture of the
-            // session — unbounded growth, surfaced by the 2026-07-25
-            // scheduled-fuzz OOM triage).
-            self.prune_ref_store();
+            self.ref_store.insert(entry.dpb_key, pic.clone());
         }
-
-        if is_reference {
-            self.prev_had_mmco5 = mmco5_triggered;
-            // §8.2.1.1 — prevPicOrderCntLsb after an MMCO-5 picture is
-            // the post-reset TopFieldOrderCnt (§8.2.1 NOTE 1 subtracts
-            // tempPicOrderCnt from Top/BottomFieldOrderCnt after decode).
-            self.prev_reference_top_foc = if mmco5_triggered {
-                poc.top_field_order_cnt - poc.pic_order_cnt
-            } else {
-                0
-            };
-            // §8.2.5.2 — remember this reference picture's `frame_num`
-            // so the next access unit can detect (and fill) any gap.
-            // MMCO-5 resets the CVS, so `prev_ref_frame_num` is cleared
-            // per §8.2.1 NOTE 1 / §8.2.5.4.5.
-            self.prev_ref_frame_num = if mmco5_triggered {
-                // Per §8.2.5.4.5 the picture that carried MMCO 5 is
-                // renumbered to frame_num 0; treat its successor as if
-                // it were the frame after frame_num 0.
-                Some(0)
-            } else {
-                Some(first_header.frame_num)
-            };
-        }
+        let live_keys: Vec<u32> = self
+            .picture_frontend
+            .references()
+            .iter()
+            .map(|e| e.dpb_key)
+            .collect();
+        self.ref_store.retain_keys(&live_keys);
 
         // `time_base` was previously stamped onto the VideoFrame for
         // downstream rescaling; the slim VideoFrame shape only carries
@@ -1987,20 +1880,12 @@ impl H264CodecDecoder {
         // its pre-reset POC (ordinarily the largest in the outgoing
         // CVS) and later CVS pictures, which use POC starting from 0
         // again, are bumped ahead of it.
-        let output_poc = if mmco5_triggered {
-            let temp = poc.pic_order_cnt;
-            let top_after = poc.top_field_order_cnt - temp;
-            let bot_after = poc.bottom_field_order_cnt - temp;
-            if first_header.field_pic_flag && first_header.bottom_field_flag {
-                bot_after
-            } else if first_header.field_pic_flag {
-                top_after
-            } else {
-                top_after.min(bot_after)
-            }
-        } else {
-            poc.pic_order_cnt
-        };
+        let output_poc = commit
+            .current_dpb_entry
+            .as_ref()
+            .filter(|_| mmco5_triggered)
+            .map(|e| e.pic_order_cnt)
+            .unwrap_or(poc.pic_order_cnt);
 
         // §C.4.4 — PAFF field pairing. A field picture is not pushed to
         // the output DPB on its own; it waits for its complementary field
@@ -2137,176 +2022,6 @@ impl H264CodecDecoder {
             }
             self.output_dpb = new_dpb;
         }
-    }
-
-    fn mint_dpb_key(&mut self) -> u32 {
-        let k = self.next_dpb_key;
-        self.next_dpb_key = self.next_dpb_key.wrapping_add(1);
-        k
-    }
-
-    /// Release stored reference pictures whose DPB entries are gone.
-    ///
-    /// §8.2.5 — a picture marked "unused for reference" can never
-    /// appear in a later slice's reference picture list, so once its
-    /// metadata entry leaves `dpb_entries` its samples are
-    /// unreachable. Called after every marking pass; keeps
-    /// `ref_store` memory bounded by the DPB size instead of growing
-    /// with each reference picture decoded in the session.
-    fn prune_ref_store(&mut self) {
-        let live: Vec<u32> = self.dpb_entries.iter().map(|e| e.dpb_key).collect();
-        self.ref_store.retain_keys(&live);
-    }
-
-    /// §8.2.5.2 — synthesise "non-existing" short-term reference frames
-    /// to fill a gap between `PrevRefFrameNum` and the current picture's
-    /// `frame_num`. Each synthetic frame advances the sliding-window
-    /// eviction state (§8.2.5.3) and the POC-state `prev_frame_num` for
-    /// `pic_order_cnt_type` 1/2, matching the encoder's assumption that
-    /// those references exist in the DPB when it emits RPLM / MMCO ops
-    /// targeting their PicNum values.
-    ///
-    /// The synthetic picture's pixel samples are marked "not available
-    /// for prediction of other pictures" per §8.2.5.2; we still insert
-    /// a placeholder [`Picture`] in the ref store so any erroneous
-    /// motion-compensation reference produces neutral (gray) output
-    /// rather than a crash. Conformant streams do not actually sample
-    /// a non-existing reference's pixels.
-    fn fill_frame_num_gap(&mut self, sps: &Sps, current_frame_num: u32) -> Result<()> {
-        let max_frame_num: u32 = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
-        // §8.2.5.2 is a no-op when the previous reference picture is
-        // the immediate predecessor (or when no reference has yet been
-        // seen — we let the first non-IDR reference picture seed
-        // `prev_ref_frame_num`).
-        let Some(prev) = self.prev_ref_frame_num else {
-            return Ok(());
-        };
-        let mut expected = (prev + 1) % max_frame_num;
-        if expected == current_frame_num {
-            return Ok(());
-        }
-
-        // Guard against a runaway loop from a bogus `current_frame_num`;
-        // the spec allows up to MaxFrameNum iterations.
-        //
-        // Round 430 (2026-07-25 scheduled-fuzz OOM triage): the loop
-        // used to allocate a full placeholder picture for EVERY missing
-        // frame_num — up to MaxFrameNum (2^16) sample buffers per gap,
-        // even though the §8.2.5.3 sliding window immediately evicts
-        // all but the newest `max_num_ref_frames` of them. Now the loop
-        // only maintains the metadata state (DPB entries, POC
-        // stepping); sample buffers are materialised afterwards for the
-        // few gap entries that actually survived the window.
-        let first_gap_key = self.next_dpb_key;
-        let mut iterations: u32 = 0;
-        while expected != current_frame_num && iterations < max_frame_num {
-            // §8.2.1.3 POC type 2 (and also §8.2.1.2 type 1) treat each
-            // non-existing frame as a reference picture with its own
-            // `frame_num`, so step the POC state's `prev_frame_num` and
-            // `prev_frame_num_offset` exactly as a real reference would.
-            if matches!(sps.pic_order_cnt_type, 1 | 2) {
-                let prev_fnum_offset = self.poc_state.prev_frame_num_offset;
-                let new_offset = if self.poc_state.prev_frame_num > expected {
-                    prev_fnum_offset + max_frame_num as i64
-                } else {
-                    prev_fnum_offset
-                };
-                self.poc_state.prev_frame_num_offset = new_offset;
-            }
-            self.poc_state.prev_frame_num = expected;
-
-            // Derive a POC for the non-existing frame so RefPicList
-            // construction for B slices (unused here but kept correct
-            // in general) has a consistent ordering key.
-            let (top_foc, bot_foc, poc_value) = non_existing_poc(sps, &self.poc_state, expected);
-
-            // §8.2.5.2 — apply the sliding window before adding, so the
-            // DPB never exceeds `max_num_ref_frames` short+long refs.
-            ref_list::sliding_window_marking(
-                &mut self.dpb_entries,
-                sps.max_num_ref_frames,
-                expected,
-                max_frame_num,
-                None,
-            );
-            // §8.2.5.4 field forms can leave one field of an entry
-            // referenced while the frame-level marking dropped — keep
-            // the entry while ANY field is still a reference.
-            self.dpb_entries.retain(|e| e.is_any_field_ref());
-
-            let key = self.mint_dpb_key();
-            let mut entry = DpbEntry {
-                frame_num: expected,
-                top_field_order_cnt: top_foc,
-                bottom_field_order_cnt: bot_foc,
-                pic_order_cnt: poc_value,
-                structure: PicStructure::Frame,
-                marking: RefMarking::ShortTerm,
-                long_term_frame_idx: 0,
-                dpb_key: key,
-                field_markings: [RefMarking::Unused; 2],
-            };
-            entry.sync_field_markings();
-            self.dpb_entries.push(entry);
-
-            self.prev_ref_frame_num = Some(expected);
-            expected = (expected + 1) % max_frame_num;
-            iterations += 1;
-        }
-
-        if iterations > 0 {
-            // §8.2.5.2 — a neutral placeholder picture for each gap
-            // entry that survived the sliding window. Samples are
-            // mid-grey (2^(bit_depth-1)) because the spec only
-            // guarantees "not available for prediction"; mid-grey keeps
-            // any accidental reference from producing wildly
-            // out-of-range residuals. Only the surviving entries (at
-            // most `max_num_ref_frames`) get sample buffers — the
-            // evicted majority were never observable by later slices.
-            let gray = gray_picture(
-                sps.pic_width_in_mbs() * 16,
-                sps.frame_height_in_mbs() * 16,
-                sps.chroma_array_type(),
-                sps.bit_depth_luma_minus8 + 8,
-                sps.bit_depth_chroma_minus8 + 8,
-            );
-            let gap_keys = first_gap_key..self.next_dpb_key;
-            for entry in &self.dpb_entries {
-                if gap_keys.contains(&entry.dpb_key) {
-                    self.ref_store.insert(entry.dpb_key, gray.clone());
-                }
-            }
-            // Real reference pictures evicted by the gap's sliding
-            // window are dead now — release their samples too.
-            self.prune_ref_store();
-        }
-
-        Ok(())
-    }
-}
-
-/// §8.2.1 — compute `(TopFieldOrderCnt, BottomFieldOrderCnt, PicOrderCnt)`
-/// for a synthetic non-existing reference frame. Only type 2 and type 1
-/// need real values; type 0 is left at (0, 0, 0) since non-existing
-/// frames with type 0 are never used to predict other pictures' POCs.
-fn non_existing_poc(sps: &Sps, state: &PocState, frame_num: u32) -> (i32, i32, i32) {
-    match sps.pic_order_cnt_type {
-        2 => {
-            // §8.2.1.3 treats a reference picture as
-            // `2 * (FrameNumOffset + frame_num)`. We use the already-
-            // updated `prev_frame_num_offset` because the caller has
-            // stepped it for this non-existing frame.
-            let poc = 2 * (state.prev_frame_num_offset + frame_num as i64);
-            let poc = poc.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-            (poc, poc, poc)
-        }
-        1 => {
-            // A conservative stand-in — type-1 streams rarely hit the
-            // gap path and we do not need pixel-exact reproduction of
-            // the expectedPicOrderCnt arithmetic here.
-            (0, 0, 0)
-        }
-        _ => (0, 0, 0),
     }
 }
 
@@ -2608,31 +2323,6 @@ fn max_dpb_mbs_for_level(level_idc: u8, constraint_set3_flag: bool) -> u32 {
     }
 }
 
-/// §7.4.3 — map `(field_pic_flag, bottom_field_flag)` into the
-/// [`PicStructure`] that `ref_list` / DPB bookkeeping consumes.
-fn pic_structure_from_flags(field_pic_flag: bool, bottom_field_flag: bool) -> PicStructure {
-    match (field_pic_flag, bottom_field_flag) {
-        (false, _) => PicStructure::Frame,
-        (true, false) => PicStructure::TopField,
-        (true, true) => PicStructure::BottomField,
-    }
-}
-
-/// Project an [`Sps`] into the subset of fields [`derive_poc`] needs.
-fn make_poc_sps(sps: &Sps) -> PocSps {
-    PocSps {
-        pic_order_cnt_type: sps.pic_order_cnt_type,
-        log2_max_frame_num_minus4: sps.log2_max_frame_num_minus4,
-        log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_pic_order_cnt_lsb_minus4,
-        delta_pic_order_always_zero_flag: sps.delta_pic_order_always_zero_flag,
-        offset_for_non_ref_pic: sps.offset_for_non_ref_pic,
-        offset_for_top_to_bottom_field: sps.offset_for_top_to_bottom_field,
-        num_ref_frames_in_pic_order_cnt_cycle: sps.num_ref_frames_in_pic_order_cnt_cycle,
-        offset_for_ref_frame: sps.offset_for_ref_frame.clone(),
-        frame_mbs_only_flag: sps.frame_mbs_only_flag,
-    }
-}
-
 /// Convert §7.3.3.1 RPLM op to the §8.2.4.3 ref_list equivalent.
 fn slice_rplm_to_ref_rplm(op: &SliceRplmOp) -> RplmOp {
     match *op {
@@ -2642,15 +2332,29 @@ fn slice_rplm_to_ref_rplm(op: &SliceRplmOp) -> RplmOp {
     }
 }
 
-/// Convert §7.3.3.3 MMCO op to the §8.2.5.4 ref_list equivalent.
-fn slice_mmco_to_ref_mmco(op: &SliceMmcoOp) -> RefMmcoOp {
-    match *op {
-        SliceMmcoOp::MarkShortTermUnused(v) => RefMmcoOp::MarkShortTermUnused(v),
-        SliceMmcoOp::MarkLongTermUnused(v) => RefMmcoOp::MarkLongTermUnused(v),
-        SliceMmcoOp::AssignLongTerm(d, ltfi) => RefMmcoOp::AssignLongTerm(d, ltfi),
-        SliceMmcoOp::SetMaxLongTermIdx(v) => RefMmcoOp::SetMaxLongTermIdx(v),
-        SliceMmcoOp::MarkAllUnused => RefMmcoOp::MarkAllUnused,
-        SliceMmcoOp::AssignCurrentLongTerm(v) => RefMmcoOp::AssignCurrentLongTerm(v),
+impl H264CodecDecoder {
+    /// Feed one complete Annex-B access unit through the software parser.
+    /// Timing comes from the packet that began this assembled AU rather than
+    /// from whichever container/PES packet happened to complete it.
+    fn feed_annex_b_access_unit(&mut self, packet: &Packet) -> Result<()> {
+        self.pending_pts = packet.pts;
+        self.pending_time_base = packet.time_base;
+
+        // Collect events first so the parser borrow ends before handle_event
+        // re-borrows decoder state during reconstruction.
+        let events: Vec<_> = self.driver.process_annex_b(&packet.data).collect();
+        for ev in events {
+            match ev {
+                Ok(ev) => {
+                    if let Err(e) = self.handle_event(ev) {
+                        self.decode_errors += 1;
+                        eprintln!("h264 slice skipped: {e}");
+                    }
+                }
+                Err(e) => return Err(Error::invalid(format!("h264 NAL parse: {e}"))),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2660,13 +2364,13 @@ impl Decoder for H264CodecDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        self.pending_pts = packet.pts;
-        self.pending_time_base = packet.time_base;
-        let data = packet.data.clone();
         match self.length_size {
             Some(n) => {
-                // AVCC framing — walk length-prefixed NAL units and
-                // hand each to the driver.
+                // AVCC framing is already packetised as explicit NAL lengths;
+                // keep the native path and do not insert Annex-B preprocessing.
+                self.pending_pts = packet.pts;
+                self.pending_time_base = packet.time_base;
+                let data = &packet.data;
                 let mut i = 0usize;
                 let n = n as usize;
                 while i < data.len() {
@@ -2685,12 +2389,6 @@ impl Decoder for H264CodecDecoder {
                         .driver
                         .process_nal(&data[i..i + len])
                         .map_err(|e| Error::invalid(format!("h264 NAL parse: {e}")))?;
-                    // Ignore per-slice errors so the stream can keep
-                    // feeding. Real errors in parse step 1 (NAL parse)
-                    // already aborted above; these are reconstruction
-                    // errors the caller may want to log, but we drop
-                    // them for now to avoid killing the stream on one
-                    // broken slice (e.g. unsupported MB type).
                     if let Err(e) = self.handle_event(ev) {
                         self.decode_errors += 1;
                         eprintln!("h264 slice skipped: {e}");
@@ -2700,23 +2398,14 @@ impl Decoder for H264CodecDecoder {
                 Ok(())
             }
             None => {
-                // Annex B framing. Collect events first so the driver
-                // borrow ends before we recurse into handle_event
-                // (which re-borrows self.driver to read active_sps /
-                // pps).
-                let events: Vec<_> = self.driver.process_annex_b(&data).collect();
-                for ev in events {
-                    match ev {
-                        Ok(ev) => {
-                            if let Err(e) = self.handle_event(ev) {
-                                self.decode_errors += 1;
-                                eprintln!("h264 slice skipped: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            return Err(Error::invalid(format!("h264 NAL parse: {e}")));
-                        }
-                    }
+                // Annex-B is a byte stream, not a container-packet format.
+                // Opt into the shared assembler so a PES boundary may split a
+                // NAL/access unit without forcing every decoder to duplicate
+                // this buffering logic. Decoders with their own streaming
+                // parser (e.g. cuvidParser) simply do not use this helper.
+                let completed = self.au_assembler.push(packet)?;
+                for access_unit in completed {
+                    self.feed_annex_b_access_unit(&access_unit)?;
                 }
                 Ok(())
             }
@@ -2758,6 +2447,11 @@ impl Decoder for H264CodecDecoder {
     }
 
     fn flush(&mut self) -> Result<()> {
+        if self.length_size.is_none() {
+            if let Some(access_unit) = self.au_assembler.flush() {
+                self.feed_annex_b_access_unit(&access_unit)?;
+            }
+        }
         // §7.3.2.9 — decode any partitioned slice still waiting for
         // (possibly absent) partition-B/C payloads at EOF.
         self.flush_pending_dp_slice()?;
@@ -2794,12 +2488,8 @@ impl Decoder for H264CodecDecoder {
         self.ready.clear();
         self.pending_pts = None;
         self.ref_store = RefPicStore::new();
-        self.dpb_entries.clear();
-        self.poc_state = PocState::default();
-        self.next_dpb_key = 0;
-        self.prev_had_mmco5 = false;
-        self.prev_reference_top_foc = 0;
-        self.prev_ref_frame_num = None;
+        self.au_assembler.reset();
+        self.picture_frontend.reset();
         // Drop any picture currently being assembled — reset implies we
         // discard in-flight state, not deliver it.
         self.in_progress = None;
@@ -3535,8 +3225,6 @@ mod tests {
     // by `tests/integration_multislice_assembly.rs`; these tests cover
     // the boundary-condition matrix without needing a real bitstream.
 
-    use crate::poc::PocResult;
-    use crate::ref_list::PicStructure;
     use crate::slice_header::{RefPicListModification, SliceHeader as Hdr, SliceType as ST};
 
     /// Minimal SPS for the seed helpers — exact field values do not
@@ -3641,7 +3329,16 @@ mod tests {
     fn seed_in_progress(dec: &mut H264CodecDecoder, nut: u8, nri: u8, header: Hdr) {
         let pic = Picture::new(16, 16, 1, 8, 8);
         let grid = MbGrid::new(1, 1);
+        let sps = test_sps();
+        let pps = test_pps();
+        let prepared = dec
+            .picture_frontend
+            .prepare_parsed_picture(nut, nri, header.clone(), sps.clone(), pps.clone(), 1)
+            .expect("prepare test picture");
+        let poc = prepared.poc;
+        let structure = prepared.structure;
         dec.in_progress = Some(PictureInProgress {
+            prepared,
             pic,
             grid,
             first_nal_unit_type: nut,
@@ -3649,20 +3346,16 @@ mod tests {
             first_header: header,
             is_reference: nri != 0,
             is_idr: nut == 5,
-            poc: PocResult {
-                top_field_order_cnt: 0,
-                bottom_field_order_cnt: 0,
-                pic_order_cnt: 0,
-            },
-            structure: PicStructure::Frame,
+            poc,
+            structure,
             pts: None,
             time_base: TimeBase::new(1, 1),
             deblock_enabled: false,
             deblock_alpha_off: 0,
             deblock_beta_off: 0,
             mb_field_flags: Vec::new(),
-            sps: test_sps(),
-            pps: test_pps(),
+            sps,
+            pps,
             any_slice_succeeded: true,
         });
     }
@@ -4202,6 +3895,7 @@ mod tests {
     /// exactly the DPB's pictures.
     #[test]
     fn frame_num_gap_fill_is_memory_bounded() {
+        use crate::slice_header::DecRefPicMarking;
         use crate::sps::Sps;
 
         let sps = Sps {
@@ -4216,7 +3910,7 @@ mod tests {
             qpprime_y_zero_transform_bypass_flag: false,
             seq_scaling_matrix_present_flag: false,
             seq_scaling_lists: None,
-            log2_max_frame_num_minus4: 12, // MaxFrameNum = 65536
+            log2_max_frame_num_minus4: 12,
             pic_order_cnt_type: 2,
             log2_max_pic_order_cnt_lsb_minus4: 0,
             delta_pic_order_always_zero_flag: false,
@@ -4226,7 +3920,7 @@ mod tests {
             offset_for_ref_frame: Vec::new(),
             max_num_ref_frames: 3,
             gaps_in_frame_num_value_allowed_flag: true,
-            pic_width_in_mbs_minus1: 3, // 64x64 — sample buffers exist but stay small
+            pic_width_in_mbs_minus1: 3,
             pic_height_in_map_units_minus1: 3,
             frame_mbs_only_flag: true,
             mb_adaptive_frame_field_flag: false,
@@ -4235,33 +3929,76 @@ mod tests {
             vui_parameters_present_flag: false,
             vui: None,
         };
-
+        let pps = test_pps();
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.prev_ref_frame_num = Some(0);
-        dec.fill_frame_num_gap(&sps, 40_000)
-            .expect("gap fill must succeed");
 
-        // §8.2.5.3 sliding window: only the newest
-        // `max_num_ref_frames` synthetic references survive.
-        assert_eq!(dec.dpb_entries.len(), 3);
-        let frame_nums: Vec<u32> = dec.dpb_entries.iter().map(|e| e.frame_num).collect();
+        // Seed PrevRefFrameNum with an IDR reference at frame_num 0.
+        let mut seed_header = hdr_base();
+        seed_header.slice_type_raw = 2;
+        seed_header.slice_type = ST::I;
+        seed_header.dec_ref_pic_marking = Some(DecRefPicMarking {
+            no_output_of_prior_pics_flag: false,
+            long_term_reference_flag: false,
+            adaptive_marking: None,
+        });
+        let seed = dec
+            .picture_frontend
+            .prepare_parsed_picture(5, 3, seed_header, sps.clone(), pps.clone(), 1)
+            .expect("prepare seed IDR");
+        let seed_commit = dec.picture_frontend.commit(seed);
+        let seed_entry = seed_commit.current_dpb_entry.expect("seed reference");
+        dec.ref_store
+            .insert(seed_entry.dpb_key, gray_picture(64, 64, 1, 8, 8));
+
+        let mut far_header = hdr_base();
+        far_header.frame_num = 40_000;
+        let far = dec
+            .picture_frontend
+            .prepare_parsed_picture(1, 2, far_header, sps.clone(), pps.clone(), 1)
+            .expect("large gap preparation");
+
+        // Tens of thousands of logical gap steps produce only the surviving
+        // sliding-window metadata, not one allocation per missing frame.
+        assert_eq!(far.references.len(), 3);
+        assert_eq!(far.synthetic_references.len(), 3);
+        let frame_nums: Vec<u32> = far.references.iter().map(|e| e.frame_num).collect();
         assert_eq!(frame_nums, vec![39_997, 39_998, 39_999]);
 
-        // The store holds sample buffers for exactly the surviving
-        // entries — not one per skipped frame_num.
-        assert_eq!(dec.ref_picture_count(), 3);
-        for e in &dec.dpb_entries {
-            let pic = dec.ref_store.get_by_key(e.dpb_key).expect("stored");
-            assert!(pic.non_existing, "gap placeholders are non-existing");
+        // The software backend materialises samples only for those surviving
+        // synthetic references. Transactionality retains the old seed until
+        // reconstruction succeeds, so the transient bound is DPB + 1 here.
+        let gray = gray_picture(64, 64, 1, 8, 8);
+        for e in &far.synthetic_references {
+            dec.ref_store.insert(e.dpb_key, gray.clone());
+        }
+        assert!(dec.ref_picture_count() <= 4);
+        for e in &far.synthetic_references {
+            assert!(dec.ref_store.get_by_key(e.dpb_key).unwrap().non_existing);
         }
 
-        // §8.2.5.2 stepped the POC state across every gap frame.
-        assert_eq!(dec.poc_state.prev_frame_num, 39_999);
-        assert_eq!(dec.prev_ref_frame_num, Some(39_999));
-
-        // A second, small gap right after must keep the bound.
-        dec.fill_frame_num_gap(&sps, 40_010).expect("second gap");
-        assert_eq!(dec.dpb_entries.len(), 3);
+        let far_commit = dec.picture_frontend.commit(far);
+        let current = far_commit.current_dpb_entry.expect("far reference");
+        dec.ref_store.insert(current.dpb_key, gray.clone());
+        let live: Vec<u32> = dec
+            .picture_frontend
+            .references()
+            .iter()
+            .map(|e| e.dpb_key)
+            .collect();
+        dec.ref_store.retain_keys(&live);
+        assert_eq!(dec.picture_frontend.references().len(), 3);
         assert_eq!(dec.ref_picture_count(), 3);
+
+        // A second gap proves the committed shared state advanced to frame
+        // 40000 instead of restarting from the original seed.
+        let mut second_header = hdr_base();
+        second_header.frame_num = 40_010;
+        let second = dec
+            .picture_frontend
+            .prepare_parsed_picture(1, 2, second_header, sps, pps, 1)
+            .expect("second gap preparation");
+        assert_eq!(second.synthetic_references.len(), 3);
+        let second_nums: Vec<u32> = second.references.iter().map(|e| e.frame_num).collect();
+        assert_eq!(second_nums, vec![40_007, 40_008, 40_009]);
     }
 }
