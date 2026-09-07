@@ -23,7 +23,7 @@
 // `oxideav-mpeg4video::simd::chunked` (mod-level `#![allow]`).
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
-use crate::inter_pred::{InterPredError, InterPredResult};
+use crate::inter_pred::{InterPredError, InterPredResult, StoredSample};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -62,9 +62,9 @@ fn tap6(s0: i32, s1: i32, s2: i32, s3: i32, s4: i32, s5: i32) -> i32 {
 /// edge replication at the row's left and right boundaries. The row
 /// itself is `iy` (already vertically clipped by the caller).
 #[inline(always)]
-fn fill_row(
+fn fill_row<T: StoredSample>(
     out: &mut [i32],
-    src: &[i32],
+    src: &[T],
     src_stride: usize,
     src_w: usize,
     iy: usize,
@@ -79,11 +79,13 @@ fn fill_row(
     if x0 >= 0 && xn <= xmax {
         // Fast path: contiguous, no clipping.
         let start = (row_base as i32 + x0) as usize;
-        out[..n].copy_from_slice(&src[start..start + n]);
+        for i in 0..n {
+            out[i] = src[start + i].widen();
+        }
     } else {
         for (k, slot) in out.iter_mut().take(n).enumerate() {
             let cx = clip3(0, xmax, x0 + k as i32) as usize;
-            *slot = src[row_base + cx];
+            *slot = src[row_base + cx].widen();
         }
     }
 }
@@ -122,8 +124,8 @@ impl LumaWs {
 /// `int_y` (clipped). Returns the materialised row of `w` samples
 /// starting at horizontal offset `int_x` for use as a "G column".
 #[inline(always)]
-fn integer_row_at(
-    src: &[i32],
+fn integer_row_at<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_w: usize,
     src_h: usize,
@@ -137,11 +139,13 @@ fn integer_row_at(
     let xmax = src_w as i32 - 1;
     let row_base = iy * src_stride;
     if int_x >= 0 && int_x + w as i32 - 1 <= xmax {
-        out[..w].copy_from_slice(&src[row_base + int_x as usize..row_base + int_x as usize + w]);
+        for i in 0..w {
+            out[i] = src[row_base + int_x as usize + i].widen();
+        }
     } else {
         for (k, slot) in out.iter_mut().take(w).enumerate() {
             let cx = clip3(0, xmax, int_x + k as i32) as usize;
-            *slot = src[row_base + cx];
+            *slot = src[row_base + cx].widen();
         }
     }
 }
@@ -150,8 +154,8 @@ fn integer_row_at(
 /// `h+5`), compute the b1 intermediate at columns `int_x .. int_x + w`
 /// and store into `ws.h_strip[r][c]`. Uses `ws.int_row` as scratch.
 #[inline(always)]
-fn build_h_strip(
-    src: &[i32],
+fn build_h_strip<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_w: usize,
     src_h: usize,
@@ -186,8 +190,8 @@ fn build_h_strip(
 /// Pure horizontal half-pel block: `(0,0) → b` only requires 1 row of
 /// H-FIR per output row.
 #[inline(always)]
-fn fill_b(
-    src: &[i32],
+fn fill_b<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_w: usize,
     src_h: usize,
@@ -221,8 +225,8 @@ fn fill_b(
 
 /// Pure vertical half-pel block: `(0,2) → h`.
 #[inline(always)]
-fn fill_h_vert(
-    src: &[i32],
+fn fill_h_vert<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_w: usize,
     src_h: usize,
@@ -243,12 +247,13 @@ fn fill_h_vert(
         let row_base = iy * src_stride;
         let xmax = src_w as i32 - 1;
         if int_x >= 0 && int_x + w as i32 - 1 <= xmax {
-            col_strip[r][..w]
-                .copy_from_slice(&src[row_base + int_x as usize..row_base + int_x as usize + w]);
+            for i in 0..w {
+                col_strip[r][i] = src[row_base + int_x as usize + i].widen();
+            }
         } else {
             for i in 0..w {
                 let cx = clip3(0, xmax, int_x + i as i32) as usize;
-                col_strip[r][i] = src[row_base + cx];
+                col_strip[r][i] = src[row_base + cx].widen();
             }
         }
     }
@@ -270,8 +275,8 @@ fn fill_h_vert(
 
 /// §8.4.2.2.1 — luma fractional-sample interpolation (chunked path).
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_luma(
-    src: &[i32],
+pub fn interpolate_luma<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_width: usize,
     src_height: usize,
@@ -325,13 +330,13 @@ pub fn interpolate_luma(
             let xmax = src_width as i32 - 1;
             let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
             if int_x >= 0 && int_x + wu as i32 - 1 <= xmax {
-                drow.copy_from_slice(
-                    &src[row_base + int_x as usize..row_base + int_x as usize + wu],
-                );
+                for i in 0..wu {
+                    drow[i] = src[row_base + int_x as usize + i].widen();
+                }
             } else {
                 for (i, slot) in drow.iter_mut().enumerate() {
                     let cx = clip3(0, xmax, int_x + i as i32) as usize;
-                    *slot = src[row_base + cx];
+                    *slot = src[row_base + cx].widen();
                 }
             }
         }
@@ -413,7 +418,7 @@ pub fn interpolate_luma(
                     } else {
                         clip3(0, xmax, int_x + i as i32) as usize
                     };
-                    let g = src[row_base + cx];
+                    let g = src[row_base + cx].widen();
                     let b_s = clip1((b_row[i] + 16) >> 5, max_v);
                     drow[i] = (g + b_s + 1) >> 1;
                 }
@@ -430,7 +435,7 @@ pub fn interpolate_luma(
                 for i in 0..wu {
                     let xi = int_x + i as i32 + 1;
                     let cx = clip3(0, xmax, xi) as usize;
-                    let h_int = src[row_base + cx];
+                    let h_int = src[row_base + cx].widen();
                     let b_s = clip1((b_row[i] + 16) >> 5, max_v);
                     drow[i] = (h_int + b_s + 1) >> 1;
                 }
@@ -627,8 +632,8 @@ pub fn interpolate_luma(
 
 /// §8.4.2.2.2 — chroma bilinear interpolation (chunked path).
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_chroma(
-    src: &[i32],
+pub fn interpolate_chroma<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_width: usize,
     src_height: usize,
@@ -678,12 +683,14 @@ pub fn interpolate_chroma(
         int_x >= 0 && int_y >= 0 && (int_x + wu as i32) <= xmax && (int_y + hu as i32) <= ymax;
 
     if inside && xf == 0 && yf == 0 {
-        // Pure integer copy.
+        // Pure integer copy with widening from compact stored samples.
         for yl in 0..hu {
             let iy = (int_y + yl as i32) as usize;
             let row_base = iy * src_stride + int_x as usize;
-            dst[yl * dst_stride..yl * dst_stride + wu]
-                .copy_from_slice(&src[row_base..row_base + wu]);
+            let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
+            for i in 0..wu {
+                drow[i] = src[row_base + i].widen();
+            }
         }
         return Ok(());
     }
@@ -700,10 +707,10 @@ pub fn interpolate_chroma(
             let row_c = (iy + 1) * src_stride + int_x as usize;
             let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
             for i in 0..wu {
-                let sa = src[row_a + i];
-                let sb = src[row_a + i + 1];
-                let sc = src[row_c + i];
-                let sd = src[row_c + i + 1];
+                let sa = src[row_a + i].widen();
+                let sb = src[row_a + i + 1].widen();
+                let sc = src[row_c + i].widen();
+                let sd = src[row_c + i + 1].widen();
                 drow[i] = (c00 * sa + c10 * sb + c01 * sc + c11 * sd + 32) >> 6;
             }
         }
@@ -719,10 +726,10 @@ pub fn interpolate_chroma(
             let cxb = clip3(0, xmax, ix + 1) as usize;
             let cya = clip3(0, ymax, iy) as usize;
             let cyc = clip3(0, ymax, iy + 1) as usize;
-            let sa = src[cya * src_stride + cxa];
-            let sb = src[cya * src_stride + cxb];
-            let sc = src[cyc * src_stride + cxa];
-            let sd = src[cyc * src_stride + cxb];
+            let sa = src[cya * src_stride + cxa].widen();
+            let sb = src[cya * src_stride + cxb].widen();
+            let sc = src[cyc * src_stride + cxa].widen();
+            let sd = src[cyc * src_stride + cxb].widen();
             let v =
                 (w8mxf * w8myf * sa + xf * w8myf * sb + w8mxf * yf * sc + xf * yf * sd + 32) >> 6;
             dst[yl * dst_stride + xl] = v;

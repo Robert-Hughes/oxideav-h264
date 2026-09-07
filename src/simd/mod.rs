@@ -30,14 +30,14 @@ pub mod scalar;
 #[cfg(feature = "nightly")]
 pub mod portable;
 
-use crate::inter_pred::InterPredResult;
+use crate::inter_pred::{InterPredResult, StoredSample};
 
 /// §8.4.2.2.1 — luma fractional-sample interpolation. See
 /// [`crate::inter_pred::interpolate_luma`] for the parameter contract.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_luma(
-    src: &[i32],
+pub fn interpolate_luma<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_width: usize,
     src_height: usize,
@@ -71,8 +71,8 @@ pub fn interpolate_luma(
 /// [`crate::inter_pred::interpolate_chroma`] for the parameter contract.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_chroma(
-    src: &[i32],
+pub fn interpolate_chroma<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_width: usize,
     src_height: usize,

@@ -306,19 +306,16 @@ fn deblock_recon_inner(
     debug_assert_eq!(mb_infos.len(), (width_mbs as usize) * (height_mbs as usize));
 
     // ------- Build a Picture from the encoder's recon planes. -------
-    // Picture stores samples as i32; promote from u8. The
-    // `chroma_array_type` argument selects 4:2:0 (1) or 4:2:2 (2)
-    // chroma layouts for the deblock walker.
+    // The shared decoder Picture now stores final-width compact samples. The
+    // encoder still owns u8 reconstruction buffers, so widen only at this
+    // compatibility boundary and let Picture compact them into its arena.
     let mut pic = Picture::new(width, height, chroma_array_type, 8, 8);
-    for (dst, src) in pic.luma.iter_mut().zip(recon_y.iter()) {
-        *dst = *src as i32;
-    }
-    for (dst, src) in pic.cb.iter_mut().zip(recon_u.iter()) {
-        *dst = *src as i32;
-    }
-    for (dst, src) in pic.cr.iter_mut().zip(recon_v.iter()) {
-        *dst = *src as i32;
-    }
+    let recon_y_i32: Vec<i32> = recon_y.iter().map(|&sample| i32::from(sample)).collect();
+    let recon_u_i32: Vec<i32> = recon_u.iter().map(|&sample| i32::from(sample)).collect();
+    let recon_v_i32: Vec<i32> = recon_v.iter().map(|&sample| i32::from(sample)).collect();
+    pic.copy_luma_from_i32(&recon_y_i32);
+    pic.copy_cb_from_i32(&recon_u_i32);
+    pic.copy_cr_from_i32(&recon_v_i32);
 
     // ------- Build the MbGrid from per-MB facts. -------
     let mut grid = MbGrid::new(width_mbs, height_mbs);
@@ -400,14 +397,20 @@ fn deblock_recon_inner(
     );
 
     // ------- Copy filtered samples back to the encoder's u8 buffers. -------
-    for (dst, src) in recon_y.iter_mut().zip(pic.luma.iter()) {
-        *dst = (*src).clamp(0, 255) as u8;
+    let mut filtered_y = vec![0i32; recon_y.len()];
+    let mut filtered_u = vec![0i32; recon_u.len()];
+    let mut filtered_v = vec![0i32; recon_v.len()];
+    pic.copy_luma_to_i32(&mut filtered_y);
+    pic.copy_cb_to_i32(&mut filtered_u);
+    pic.copy_cr_to_i32(&mut filtered_v);
+    for (dst, src) in recon_y.iter_mut().zip(filtered_y) {
+        *dst = src.clamp(0, 255) as u8;
     }
-    for (dst, src) in recon_u.iter_mut().zip(pic.cb.iter()) {
-        *dst = (*src).clamp(0, 255) as u8;
+    for (dst, src) in recon_u.iter_mut().zip(filtered_u) {
+        *dst = src.clamp(0, 255) as u8;
     }
-    for (dst, src) in recon_v.iter_mut().zip(pic.cr.iter()) {
-        *dst = (*src).clamp(0, 255) as u8;
+    for (dst, src) in recon_v.iter_mut().zip(filtered_v) {
+        *dst = src.clamp(0, 255) as u8;
     }
 }
 
@@ -440,11 +443,9 @@ pub fn deblock_recon_deep(
         bit_depth_luma,
         bit_depth_chroma,
     );
-    debug_assert_eq!(pic.luma.len(), recon_y.len());
-    debug_assert_eq!(pic.cb.len(), recon_u.len());
-    pic.luma.copy_from_slice(recon_y);
-    pic.cb.copy_from_slice(recon_u);
-    pic.cr.copy_from_slice(recon_v);
+    pic.copy_luma_from_i32(recon_y);
+    pic.copy_cb_from_i32(recon_u);
+    pic.copy_cr_from_i32(recon_v);
 
     let mut grid = MbGrid::new(width_mbs, height_mbs);
     for (i, info) in mb_infos.iter().enumerate() {
@@ -496,9 +497,9 @@ pub fn deblock_recon_deep(
         false,
         &[],
     );
-    recon_y.copy_from_slice(&pic.luma);
-    recon_u.copy_from_slice(&pic.cb);
-    recon_v.copy_from_slice(&pic.cr);
+    pic.copy_luma_to_i32(recon_y);
+    pic.copy_cb_to_i32(recon_u);
+    pic.copy_cr_to_i32(recon_v);
 }
 
 /// Convenience helper: derive a `luma_nonzero_4x4` mask from a per-block

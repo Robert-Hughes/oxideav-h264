@@ -6,14 +6,14 @@
 //! reference while we develop the chunked/portable variants.
 
 use crate::inter_pred::{
-    interpolate_chroma as ip_chroma, interpolate_luma as ip_luma, InterPredResult,
+    interpolate_chroma as ip_chroma, interpolate_luma as ip_luma, InterPredResult, StoredSample,
 };
 
 /// §8.4.2.2.1 — luma interpolation (scalar reference).
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_luma(
-    src: &[i32],
+pub fn interpolate_luma<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_width: usize,
     src_height: usize,
@@ -36,8 +36,8 @@ pub fn interpolate_luma(
 /// §8.4.2.2.2 — chroma bilinear interpolation (scalar reference).
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_chroma(
-    src: &[i32],
+pub fn interpolate_chroma<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_width: usize,
     src_height: usize,

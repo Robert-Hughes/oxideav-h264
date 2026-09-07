@@ -3,13 +3,13 @@
 //! This module is only compiled when the `nightly` cargo feature is
 //! enabled. The default (stable) build path goes through `chunked`.
 
-use crate::inter_pred::InterPredResult;
+use crate::inter_pred::{InterPredResult, StoredSample};
 
 /// §8.4.2.2.1 — luma fractional-sample interpolation (portable path).
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_luma(
-    src: &[i32],
+pub fn interpolate_luma<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_width: usize,
     src_height: usize,
@@ -34,8 +34,8 @@ pub fn interpolate_luma(
 /// §8.4.2.2.2 — chroma bilinear interpolation (portable path).
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn interpolate_chroma(
-    src: &[i32],
+pub fn interpolate_chroma<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_width: usize,
     src_height: usize,

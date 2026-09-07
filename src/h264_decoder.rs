@@ -54,7 +54,7 @@ use crate::access_unit::AnnexBAccessUnitAssembler;
 use crate::decoder::{Decoder as H264Driver, Event};
 use crate::dpb_output::{DpbOutput, OutputEntry};
 use crate::mb_grid::MbGrid;
-use crate::picture::Picture;
+use crate::picture::{Picture, SamplePlane};
 use crate::picture_frontend::{H264PictureFrontend, PreparedH264Picture};
 use crate::poc::PocResult;
 use crate::ref_list::{self, DpbEntry, PicStructure, RplmOp};
@@ -1073,7 +1073,7 @@ impl H264CodecDecoder {
                     sps.bit_depth_chroma_minus8 + 8,
                 );
                 for entry in &prepared.synthetic_references {
-                    self.ref_store.insert(entry.dpb_key, gray.clone());
+                    self.ref_store.insert(entry.dpb_key, gray.deep_copy());
                 }
             }
 
@@ -1839,7 +1839,7 @@ impl H264CodecDecoder {
                 pic.pic_order_cnt = entry.pic_order_cnt;
                 pic.frame_num = entry.frame_num;
             }
-            self.ref_store.insert(entry.dpb_key, pic.clone());
+            self.ref_store.insert(entry.dpb_key, pic.deep_copy());
         }
         let live_keys: Vec<u32> = self
             .picture_frontend
@@ -2046,15 +2046,9 @@ fn gray_picture(
     p.non_existing = true;
     let grey_y: i32 = 1 << (bit_depth_y.saturating_sub(1));
     let grey_c: i32 = 1 << (bit_depth_c.saturating_sub(1));
-    for v in p.luma.iter_mut() {
-        *v = grey_y;
-    }
-    for v in p.cb.iter_mut() {
-        *v = grey_c;
-    }
-    for v in p.cr.iter_mut() {
-        *v = grey_c;
-    }
+    p.fill_luma(grey_y);
+    p.fill_cb(grey_c);
+    p.fill_cr(grey_c);
     p
 }
 
@@ -2562,30 +2556,29 @@ fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
         top.bit_depth_chroma,
     );
 
-    // Luma: copy each field row into its parity-selected frame row.
+    // Luma: approved PAFF fallback copy. Widen one source row into scratch,
+    // then compact it directly into the parity-selected destination row.
     let wl = w as usize;
+    let mut luma_row = vec![0i32; wl];
     for r in 0..field_h as usize {
-        let src = &top.luma[r * wl..r * wl + wl];
-        let dst_row = 2 * r;
-        frame.luma[dst_row * wl..dst_row * wl + wl].copy_from_slice(src);
-        let src_b = &bottom.luma[r * wl..r * wl + wl];
-        let dst_row_b = 2 * r + 1;
-        frame.luma[dst_row_b * wl..dst_row_b * wl + wl].copy_from_slice(src_b);
+        top.copy_luma_range_to_i32(r * wl, &mut luma_row);
+        frame.copy_luma_range_from_i32((2 * r) * wl, &luma_row);
+        bottom.copy_luma_range_to_i32(r * wl, &mut luma_row);
+        frame.copy_luma_range_from_i32((2 * r + 1) * wl, &luma_row);
     }
 
-    // Chroma: same interleave on each chroma plane.
+    // Chroma: same explicit PAFF copy on each chroma plane.
     if top.chroma_array_type != 0 {
         let cw = top.chroma_width() as usize;
         let cfh = top.chroma_height() as usize;
+        let mut chroma_row = vec![0i32; cw];
         for r in 0..cfh {
-            let dst_row = 2 * r;
-            let dst_row_b = 2 * r + 1;
-            frame.cb[dst_row * cw..dst_row * cw + cw].copy_from_slice(&top.cb[r * cw..r * cw + cw]);
-            frame.cb[dst_row_b * cw..dst_row_b * cw + cw]
-                .copy_from_slice(&bottom.cb[r * cw..r * cw + cw]);
-            frame.cr[dst_row * cw..dst_row * cw + cw].copy_from_slice(&top.cr[r * cw..r * cw + cw]);
-            frame.cr[dst_row_b * cw..dst_row_b * cw + cw]
-                .copy_from_slice(&bottom.cr[r * cw..r * cw + cw]);
+            for plane in 0..2u8 {
+                top.copy_chroma_range_to_i32(plane, r * cw, &mut chroma_row);
+                frame.copy_chroma_range_from_i32(plane, (2 * r) * cw, &chroma_row);
+                bottom.copy_chroma_range_to_i32(plane, r * cw, &mut chroma_row);
+                frame.copy_chroma_range_from_i32(plane, (2 * r + 1) * cw, &chroma_row);
+            }
         }
     }
 
@@ -2615,61 +2608,48 @@ fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
 fn picture_to_video_frame(pic: &Picture, pts: Option<i64>) -> VideoFrame {
     let w = pic.width_in_samples as usize;
     let cw = pic.chroma_width() as usize;
+    let wide_container = pic.bit_depth_luma.max(pic.bit_depth_chroma) > 8;
 
-    // Samples wider than 8-bit are stored as little-endian u16 (two
-    // bytes per sample) — matches the `Yuv*P10Le` / `Yuv*P12Le` layouts
-    // documented on `PixelFormat`. Both High10 (bit_depth=10) and
-    // High444 / High422 12-bit use the same 16-bit container, so a
-    // single ">8 bit" branch covers every >8-bit case the H.264 spec
-    // exposes (§7.4.2.1.1 caps `bit_depth_luma_minus8` at 6).
-    let luma_wide = pic.bit_depth_luma > 8;
-    let chroma_wide = pic.bit_depth_chroma > 8;
-
-    let luma_max: i32 = (1i32 << pic.bit_depth_luma) - 1;
-    let chroma_max: i32 = (1i32 << pic.bit_depth_chroma) - 1;
-
-    let luma_data: Vec<u8> = if luma_wide {
-        let mut out = Vec::with_capacity(pic.luma.len() * 2);
-        for &s in &pic.luma {
-            let v = s.clamp(0, luma_max) as u16;
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        out
-    } else {
-        pic.luma.iter().map(|&s| s.clamp(0, 255) as u8).collect()
-    };
-    let luma_stride = if luma_wide { w * 2 } else { w };
-    let mut planes = vec![VideoPlane {
-        stride: luma_stride,
-        data: luma_data,
-    }];
-    if pic.chroma_array_type != 0 {
-        let chroma_stride = if chroma_wide { cw * 2 } else { cw };
-        let pack_chroma = |src: &[i32]| -> Vec<u8> {
-            if chroma_wide {
+    // This compatibility path copies already-final compact sample storage; it
+    // performs no i32 conversion. The normal progressive path will disappear
+    // in stage 3 when it returns the frozen arena lease directly.
+    let plane_bytes = |src: SamplePlane<'_>| -> Vec<u8> {
+        match src {
+            SamplePlane::U8(src) => src.to_vec(),
+            SamplePlane::U16(src) => {
                 let mut out = Vec::with_capacity(src.len() * 2);
-                for &s in src {
-                    let v = s.clamp(0, chroma_max) as u16;
-                    out.extend_from_slice(&v.to_le_bytes());
+                for &stored_le in src {
+                    // `stored_le` is already endian-adjusted so its native memory
+                    // bytes are the public little-endian pixel representation.
+                    out.extend_from_slice(&stored_le.to_ne_bytes());
                 }
                 out
-            } else {
-                src.iter().map(|&s| s.clamp(0, 255) as u8).collect()
             }
-        };
-        let cb = pack_chroma(&pic.cb);
-        let cr = pack_chroma(&pic.cr);
+        }
+    };
+
+    let bytes_per_sample = if wide_container { 2 } else { 1 };
+    let mut planes = vec![VideoPlane {
+        stride: w * bytes_per_sample,
+        data: plane_bytes(pic.luma_plane()),
+    }];
+    if pic.chroma_array_type != 0 {
+        let chroma_stride = cw * bytes_per_sample;
         planes.push(VideoPlane {
             stride: chroma_stride,
-            data: cb,
+            data: plane_bytes(pic.cb_plane()),
         });
         planes.push(VideoPlane {
             stride: chroma_stride,
-            data: cr,
+            data: plane_bytes(pic.cr_plane()),
         });
     }
 
-    VideoFrame { pts, planes }
+    let mut frame = VideoFrame { pts, planes };
+    if let Some(bits) = pic.significant_bits_metadata() {
+        frame.set_significant_bits(bits);
+    }
+    frame
 }
 
 #[cfg(test)]
@@ -3775,15 +3755,9 @@ mod tests {
     /// given POC + frame_num stamped on.
     fn field_pic(w: u32, field_h: u32, fill: i32, cfill: i32, poc: i32, frame_num: u32) -> Picture {
         let mut p = Picture::new(w, field_h, 1, 8, 8);
-        for s in p.luma.iter_mut() {
-            *s = fill;
-        }
-        for s in p.cb.iter_mut() {
-            *s = cfill;
-        }
-        for s in p.cr.iter_mut() {
-            *s = cfill;
-        }
+        p.fill_luma(fill);
+        p.fill_cb(cfill);
+        p.fill_cr(cfill);
         p.pic_order_cnt = poc;
         p.frame_num = frame_num;
         p
@@ -3806,7 +3780,7 @@ mod tests {
         for r in 0..(field_h * 2) as usize {
             let expect = if r % 2 == 0 { 10 } else { 20 };
             for c in 0..wl {
-                assert_eq!(frame.luma[r * wl + c], expect, "luma row {r}");
+                assert_eq!(frame.luma_sample(r * wl + c), expect, "luma row {r}");
             }
         }
         // Chroma: 4:2:0 → half-width, half field height; interleave on
@@ -3816,8 +3790,8 @@ mod tests {
         for r in 0..(cfh * 2) {
             let expect = if r % 2 == 0 { 110 } else { 120 };
             for c in 0..cw {
-                assert_eq!(frame.cb[r * cw + c], expect, "cb row {r}");
-                assert_eq!(frame.cr[r * cw + c], expect, "cr row {r}");
+                assert_eq!(frame.cb_sample(r * cw + c), expect, "cb row {r}");
+                assert_eq!(frame.cr_sample(r * cw + c), expect, "cr row {r}");
             }
         }
         // §8.2.1 eq. 8-1 — frame POC = min(top, bottom) field POC.
@@ -3969,7 +3943,7 @@ mod tests {
         // reconstruction succeeds, so the transient bound is DPB + 1 here.
         let gray = gray_picture(64, 64, 1, 8, 8);
         for e in &far.synthetic_references {
-            dec.ref_store.insert(e.dpb_key, gray.clone());
+            dec.ref_store.insert(e.dpb_key, gray.deep_copy());
         }
         assert!(dec.ref_picture_count() <= 4);
         for e in &far.synthetic_references {
@@ -3978,7 +3952,7 @@ mod tests {
 
         let far_commit = dec.picture_frontend.commit(far);
         let current = far_commit.current_dpb_entry.expect("far reference");
-        dec.ref_store.insert(current.dpb_key, gray.clone());
+        dec.ref_store.insert(current.dpb_key, gray.deep_copy());
         let live: Vec<u32> = dec
             .picture_frontend
             .references()

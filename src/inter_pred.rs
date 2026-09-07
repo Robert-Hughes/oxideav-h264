@@ -22,6 +22,36 @@
 // argument lists). Suppress clippy's too_many_arguments here.
 #![allow(clippy::too_many_arguments)]
 
+/// Compact decoded-reference sample accepted by the interpolation kernels.
+///
+/// Stored pictures use `u8` or little-endian `u16`; `i32` remains implemented
+/// for tests and callers that already have widened scratch/reference data. All
+/// FIR/weight arithmetic widens through this trait before calculation.
+pub trait StoredSample: Copy {
+    fn widen(self) -> i32;
+}
+
+impl StoredSample for u8 {
+    #[inline(always)]
+    fn widen(self) -> i32 {
+        self as i32
+    }
+}
+
+impl StoredSample for u16 {
+    #[inline(always)]
+    fn widen(self) -> i32 {
+        u16::from_le(self) as i32
+    }
+}
+
+impl StoredSample for i32 {
+    #[inline(always)]
+    fn widen(self) -> i32 {
+        self
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InterPredError {
     #[error("fractional luma component {0} out of range 0..=3")]
@@ -63,10 +93,17 @@ fn clip1(x: i32, bit_depth: u32) -> i32 {
 /// Fetch a single reference-plane sample with edge replication, per
 /// §8.4.2.2.1 eq. 8-239 / 8-240.
 #[inline]
-fn ref_sample(src: &[i32], src_stride: usize, src_w: usize, src_h: usize, x: i32, y: i32) -> i32 {
+fn ref_sample<T: StoredSample>(
+    src: &[T],
+    src_stride: usize,
+    src_w: usize,
+    src_h: usize,
+    x: i32,
+    y: i32,
+) -> i32 {
     let cx = clip3(0, src_w as i32 - 1, x) as usize;
     let cy = clip3(0, src_h as i32 - 1, y) as usize;
-    src[cy * src_stride + cx]
+    src[cy * src_stride + cx].widen()
 }
 
 /// 6-tap FIR with taps `{1, -5, 20, 20, -5, 1}` applied to six samples
@@ -84,7 +121,14 @@ fn tap6(s0: i32, s1: i32, s2: i32, s3: i32, s4: i32, s5: i32) -> i32 {
 /// integer location (`x`, `y`) by applying the 6-tap FIR horizontally:
 /// `E - 5F + 20G + 20H - 5I + J` with E=(x-2,y)..J=(x+3,y).
 #[inline]
-fn horiz_b1(src: &[i32], src_stride: usize, src_w: usize, src_h: usize, x: i32, y: i32) -> i32 {
+fn horiz_b1<T: StoredSample>(
+    src: &[T],
+    src_stride: usize,
+    src_w: usize,
+    src_h: usize,
+    x: i32,
+    y: i32,
+) -> i32 {
     let s0 = ref_sample(src, src_stride, src_w, src_h, x - 2, y);
     let s1 = ref_sample(src, src_stride, src_w, src_h, x - 1, y);
     let s2 = ref_sample(src, src_stride, src_w, src_h, x, y);
@@ -98,7 +142,14 @@ fn horiz_b1(src: &[i32], src_stride: usize, src_w: usize, src_h: usize, x: i32, 
 /// by applying the 6-tap FIR vertically: `A - 5C + 20G + 20M - 5R + T`
 /// with A=(x,y-2)..T=(x,y+3).
 #[inline]
-fn vert_h1(src: &[i32], src_stride: usize, src_w: usize, src_h: usize, x: i32, y: i32) -> i32 {
+fn vert_h1<T: StoredSample>(
+    src: &[T],
+    src_stride: usize,
+    src_w: usize,
+    src_h: usize,
+    x: i32,
+    y: i32,
+) -> i32 {
     let s0 = ref_sample(src, src_stride, src_w, src_h, x, y - 2);
     let s1 = ref_sample(src, src_stride, src_w, src_h, x, y - 1);
     let s2 = ref_sample(src, src_stride, src_w, src_h, x, y);
@@ -114,7 +165,14 @@ fn vert_h1(src: &[i32], src_stride: usize, src_w: usize, src_h: usize, x: i32, y
 /// cc, dd, h1, m1, ee, ff are all horizontal-FIR intermediates at
 /// x = (target) and y = (-2..3 relative to target).
 #[inline]
-fn j1_at(src: &[i32], src_stride: usize, src_w: usize, src_h: usize, x: i32, y: i32) -> i32 {
+fn j1_at<T: StoredSample>(
+    src: &[T],
+    src_stride: usize,
+    src_w: usize,
+    src_h: usize,
+    x: i32,
+    y: i32,
+) -> i32 {
     // Re-use horiz_b1 at six different y lines.
     let b_m2 = horiz_b1(src, src_stride, src_w, src_h, x, y - 2);
     let b_m1 = horiz_b1(src, src_stride, src_w, src_h, x, y - 1);
@@ -129,8 +187,8 @@ fn j1_at(src: &[i32], src_stride: usize, src_w: usize, src_h: usize, x: i32, y: 
 /// `ix`/`iy` is the integer sample location (Clip3-handled inside);
 /// `(xFrac, yFrac)` selects one of the 16 sub-pel positions per
 /// Table 8-12.
-fn luma_pred_one(
-    src: &[i32],
+fn luma_pred_one<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_w: usize,
     src_h: usize,
@@ -142,27 +200,51 @@ fn luma_pred_one(
 ) -> i32 {
     // Full-pel sample G = reference at (ix, iy).
     #[inline]
-    fn g(s: &[i32], st: usize, w: usize, h: usize, x: i32, y: i32) -> i32 {
+    fn g<T: StoredSample>(s: &[T], st: usize, w: usize, h: usize, x: i32, y: i32) -> i32 {
         ref_sample(s, st, w, h, x, y)
     }
 
     // Half-pel horizontal sample b at (ix, iy): Clip1Y((b1 + 16) >> 5).
     #[inline]
-    fn b_at(s: &[i32], st: usize, w: usize, h: usize, x: i32, y: i32, bd: u32) -> i32 {
+    fn b_at<T: StoredSample>(
+        s: &[T],
+        st: usize,
+        w: usize,
+        h: usize,
+        x: i32,
+        y: i32,
+        bd: u32,
+    ) -> i32 {
         let b1 = horiz_b1(s, st, w, h, x, y);
         clip1((b1 + 16) >> 5, bd)
     }
 
     // Half-pel vertical sample h at (ix, iy): Clip1Y((h1 + 16) >> 5).
     #[inline]
-    fn h_at(s: &[i32], st: usize, w: usize, h: usize, x: i32, y: i32, bd: u32) -> i32 {
+    fn h_at<T: StoredSample>(
+        s: &[T],
+        st: usize,
+        w: usize,
+        h: usize,
+        x: i32,
+        y: i32,
+        bd: u32,
+    ) -> i32 {
         let h1 = vert_h1(s, st, w, h, x, y);
         clip1((h1 + 16) >> 5, bd)
     }
 
     // Half-pel diagonal sample j at (ix, iy): Clip1Y((j1 + 512) >> 10).
     #[inline]
-    fn j_at(s: &[i32], st: usize, w: usize, h: usize, x: i32, y: i32, bd: u32) -> i32 {
+    fn j_at<T: StoredSample>(
+        s: &[T],
+        st: usize,
+        w: usize,
+        h: usize,
+        x: i32,
+        y: i32,
+        bd: u32,
+    ) -> i32 {
         let j1 = j1_at(s, st, w, h, x, y);
         clip1((j1 + 512) >> 10, bd)
     }
@@ -281,8 +363,8 @@ fn luma_pred_one(
 /// output block. `x_frac`, `y_frac` ∈ 0..=3.
 ///
 /// Samples outside the picture are replicated from the edge per §8.4.2.2.
-pub fn interpolate_luma(
-    src: &[i32],
+pub fn interpolate_luma<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_width: usize,
     src_height: usize,
@@ -345,8 +427,8 @@ pub fn interpolate_luma(
 ///
 /// where A,B,C,D are the four surrounding integer chroma samples
 /// after edge replication per eq. 8-262 .. 8-269.
-pub fn interpolate_chroma(
-    src: &[i32],
+pub fn interpolate_chroma<T: StoredSample>(
+    src: &[T],
     src_stride: usize,
     src_width: usize,
     src_height: usize,

@@ -200,7 +200,10 @@ fn i16x16_dc_idr(qp: i32, seed: u32) -> Vec<u8> {
 }
 
 /// Decode to per-plane byte vectors (LE u16 packing at >8-bit).
-fn decode_all(stream: &[u8]) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+fn decode_all(
+    stream: &[u8],
+    expected_significant_bits: Option<&[u8]>,
+) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
     let pkt = Packet::new(0, TimeBase::new(1, 25), stream.to_vec()).with_pts(0);
     dec.send_packet(&pkt).expect("send_packet");
@@ -209,11 +212,13 @@ fn decode_all(stream: &[u8]) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Video(vf)) => {
-                assert_eq!(vf.planes.len(), 3);
+                assert_eq!(vf.significant_bits(), expected_significant_bits);
+                let planes = vf.image_planes();
+                assert_eq!(planes.len(), 3);
                 out.push((
-                    vf.planes[0].data.to_vec(),
-                    vf.planes[1].data.to_vec(),
-                    vf.planes[2].data.to_vec(),
+                    planes[0].data.to_vec(),
+                    planes[1].data.to_vec(),
+                    planes[2].data.to_vec(),
                 ));
             }
             Ok(_) => continue,
@@ -285,7 +290,11 @@ fn deep_bit_depth_ipcm_roundtrips_exact() {
         assert!(u.iter().any(|&s| s > 1023), "{bit_depth}-bit Cb range");
         let mut stream = parameter_sets(bit_depth);
         stream.extend_from_slice(&ipcm_idr(bit_depth, &y, &u, &v));
-        let frames = decode_all(&stream);
+        let significant_bits = (bit_depth == 14).then_some([14u8; 3]);
+        let frames = decode_all(
+            &stream,
+            significant_bits.as_ref().map(|bits| bits.as_slice()),
+        );
         assert_eq!(frames.len(), 1, "{bit_depth}-bit PCM frame count");
         assert_eq!(frames[0].0, le_bytes(&y), "{bit_depth}-bit PCM luma");
         assert_eq!(frames[0].1, le_bytes(&u), "{bit_depth}-bit PCM Cb");
@@ -304,7 +313,11 @@ fn deep_bit_depth_i16x16_dc_residual_matches_reference_decoder() {
     for (bit_depth, seed) in [(12u32, 0xC0FFEE), (14, 0xBEEF01)] {
         let mut stream = parameter_sets(bit_depth);
         stream.extend_from_slice(&i16x16_dc_idr(26, seed));
-        let frames = decode_all(&stream);
+        let significant_bits = (bit_depth == 14).then_some([14u8; 3]);
+        let frames = decode_all(
+            &stream,
+            significant_bits.as_ref().map(|bits| bits.as_slice()),
+        );
         assert_eq!(frames.len(), 1, "{bit_depth}-bit I16x16 frame count");
         // The residual must genuinely move samples off the flat DC
         // prediction (1 << (BitDepth − 1)) — pin some variation.

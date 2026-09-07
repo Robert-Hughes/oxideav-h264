@@ -50,7 +50,7 @@ use crate::mv_deriv::{
     derive_b_spatial_direct_with_d, derive_median_mvpred, derive_mvpred_with_d,
     derive_p_skip_mv_with_d, Mv, MvpredInputs, MvpredShape, NeighbourMv,
 };
-use crate::picture::Picture;
+use crate::picture::{Picture, SamplePlane};
 use crate::pps::Pps;
 use crate::ref_store::RefPicProvider;
 use crate::simd::{interpolate_chroma, interpolate_luma};
@@ -4996,7 +4996,9 @@ fn process_partition<R: RefPicProvider>(
                 rp.height_in_samples,
                 rp.pic_order_cnt,
                 fld,
-                rp.luma.iter().take(64).map(|&v| v as u32).sum::<u32>()
+                (0..rp.luma_plane().len().min(64))
+                    .map(|i| rp.luma_sample(i) as u32)
+                    .sum::<u32>()
             );
         }
         mc_luma_partition(
@@ -5021,7 +5023,9 @@ fn process_partition<R: RefPicProvider>(
                 rp.height_in_samples,
                 rp.pic_order_cnt,
                 fld,
-                rp.luma.iter().take(64).map(|&v| v as u32).sum::<u32>()
+                (0..rp.luma_plane().len().min(64))
+                    .map(|i| rp.luma_sample(i) as u32)
+                    .sum::<u32>()
             );
         }
         mc_luma_partition(
@@ -5729,6 +5733,60 @@ fn process_partition<R: RefPicProvider>(
     Ok(())
 }
 
+fn interpolate_luma_stored(
+    src: SamplePlane<'_>,
+    src_stride: usize,
+    src_width: usize,
+    src_height: usize,
+    int_x: i32,
+    int_y: i32,
+    x_frac: u8,
+    y_frac: u8,
+    w: u32,
+    h: u32,
+    bit_depth: u32,
+    dst: &mut [i32],
+    dst_stride: usize,
+) -> crate::inter_pred::InterPredResult<()> {
+    match src {
+        SamplePlane::U8(src) => interpolate_luma(
+            src, src_stride, src_width, src_height, int_x, int_y, x_frac, y_frac, w, h, bit_depth,
+            dst, dst_stride,
+        ),
+        SamplePlane::U16(src) => interpolate_luma(
+            src, src_stride, src_width, src_height, int_x, int_y, x_frac, y_frac, w, h, bit_depth,
+            dst, dst_stride,
+        ),
+    }
+}
+
+fn interpolate_chroma_stored(
+    src: SamplePlane<'_>,
+    src_stride: usize,
+    src_width: usize,
+    src_height: usize,
+    int_x: i32,
+    int_y: i32,
+    x_frac: u8,
+    y_frac: u8,
+    w: u32,
+    h: u32,
+    bit_depth: u32,
+    dst: &mut [i32],
+    dst_stride: usize,
+) -> crate::inter_pred::InterPredResult<()> {
+    match src {
+        SamplePlane::U8(src) => interpolate_chroma(
+            src, src_stride, src_width, src_height, int_x, int_y, x_frac, y_frac, w, h, bit_depth,
+            dst, dst_stride,
+        ),
+        SamplePlane::U16(src) => interpolate_chroma(
+            src, src_stride, src_width, src_height, int_x, int_y, x_frac, y_frac, w, h, bit_depth,
+            dst, dst_stride,
+        ),
+    }
+}
+
 /// §8.4.2.2 — motion-compensate one partition's luma plane. `dst`
 /// is the partition-sized output buffer (w * h samples, row-major).
 ///
@@ -5780,14 +5838,14 @@ fn mc_luma_partition(
     // §8.4.2.1 — field view of a stored frame: rows of one parity,
     // exposed zero-copy as a doubled-stride half-height plane.
     let stride = ref_pic.width_in_samples as usize;
-    let (src, src_stride, src_h): (&[i32], usize, usize) = match field {
+    let (src, src_stride, src_h) = match field {
         Some(parity) => (
-            &ref_pic.luma[(parity as usize) * stride..],
+            ref_pic.luma_plane().offset((parity as usize) * stride),
             stride * 2,
             (ref_pic.height_in_samples as usize) / 2,
         ),
         None => (
-            &ref_pic.luma[..],
+            ref_pic.luma_plane(),
             stride,
             ref_pic.height_in_samples as usize,
         ),
@@ -5799,7 +5857,7 @@ fn mc_luma_partition(
         });
     }
 
-    interpolate_luma(
+    interpolate_luma_stored(
         src, src_stride, stride, src_h, int_x, int_y, x_frac, y_frac, w, h, bit_depth, dst,
         w as usize,
     )
@@ -5873,8 +5931,8 @@ fn mc_chroma_partition(
         });
     }
 
-    interpolate_chroma(
-        &ref_pic.cb[row_off..],
+    interpolate_chroma_stored(
+        ref_pic.cb_plane().offset(row_off),
         src_stride,
         cw,
         src_h,
@@ -5889,8 +5947,8 @@ fn mc_chroma_partition(
         w as usize,
     )
     .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
-    interpolate_chroma(
-        &ref_pic.cr[row_off..],
+    interpolate_chroma_stored(
+        ref_pic.cr_plane().offset(row_off),
         src_stride,
         cw,
         src_h,
@@ -5965,8 +6023,8 @@ fn mc_chroma_partition_444(
 
     // §8.4.2.2.1 — luma interpolation process applied to each chroma
     // plane (the same 6-tap kernel `mc_luma_partition` drives).
-    interpolate_luma(
-        &ref_pic.cb[row_off..],
+    interpolate_luma_stored(
+        ref_pic.cb_plane().offset(row_off),
         src_stride,
         cw,
         src_h,
@@ -5981,8 +6039,8 @@ fn mc_chroma_partition_444(
         w as usize,
     )
     .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
-    interpolate_luma(
-        &ref_pic.cr[row_off..],
+    interpolate_luma_stored(
+        ref_pic.cr_plane().offset(row_off),
         src_stride,
         cw,
         src_h,
@@ -9859,7 +9917,12 @@ fn deblock_plane_chroma(
                             if deblock_trace_enabled() {
                                 eprintln!(
                                     "DBL C{} Vx={edge_x} y0={y0} bs={bs} plane={plane} p_addr={p_addr} q_addr={q_addr} p_is_intra={} q_is_intra={} p_nz={} q_nz={} diff_ref_mv={}",
-                                    plane, p_info.is_intra, q_info.is_intra, p_has_nz, q_has_nz, diff_ref_mv,
+                                    plane,
+                                    p_info.is_intra,
+                                    q_info.is_intra,
+                                    p_has_nz,
+                                    q_has_nz,
+                                    diff_ref_mv,
                                 );
                             }
                             if bs == 0 {
@@ -10514,17 +10577,16 @@ fn filter_vertical_edge_luma(
     };
     let pic_w = pic.width_in_samples as i32;
     let pic_h = pic.height_in_samples as i32;
-    // Fast in-bounds path: the 8 samples per row are at columns
-    // edge_x-4 .. edge_x+3, all 4 rows are y0 .. y0+3. When the edge
-    // is fully inside the picture (the common case for picture-internal
-    // edges), we can take a contiguous &mut [i32] slice and avoid the
-    // per-pixel bounds-checked accessors.
+    // Fast in-bounds path: widen only the eight samples participating in
+    // one edge, filter in i32, then write the compact samples back.
     if edge_x >= 4 && edge_x + 4 <= pic_w && y0 >= 0 && y0 + 4 <= pic_h {
         let stride = pic_w as usize;
         let base_x = (edge_x - 4) as usize;
         for dy in 0..4 {
             let y = (y0 + dy) as usize;
-            let row = &mut pic.luma[y * stride + base_x..y * stride + base_x + 8];
+            let start = y * stride + base_x;
+            let mut row = [0i32; 8];
+            pic.copy_luma_range_to_i32(start, &mut row);
             let p3 = row[0];
             let q3 = row[7];
             let mut p2 = row[1];
@@ -10553,6 +10615,7 @@ fn filter_vertical_edge_luma(
             row[4] = q0;
             row[5] = q1;
             row[6] = q2;
+            pic.copy_luma_range_from_i32(start, &row);
         }
         return;
     }
@@ -10633,14 +10696,14 @@ fn filter_horizontal_edge_luma(
             let x = (x0 + dx) as usize;
             let p3_idx = ((edge_y - 4) as usize) * stride + x;
             let q3_idx = ((edge_y + 3) as usize) * stride + x;
-            let p3 = pic.luma[p3_idx];
-            let q3 = pic.luma[q3_idx];
-            let mut p2 = pic.luma[((edge_y - 3) as usize) * stride + x];
-            let mut p1 = pic.luma[((edge_y - 2) as usize) * stride + x];
-            let mut p0 = pic.luma[((edge_y - 1) as usize) * stride + x];
-            let mut q0 = pic.luma[((edge_y) as usize) * stride + x];
-            let mut q1 = pic.luma[((edge_y + 1) as usize) * stride + x];
-            let mut q2 = pic.luma[((edge_y + 2) as usize) * stride + x];
+            let p3 = pic.luma_sample(p3_idx);
+            let q3 = pic.luma_sample(q3_idx);
+            let mut p2 = pic.luma_sample(((edge_y - 3) as usize) * stride + x);
+            let mut p1 = pic.luma_sample(((edge_y - 2) as usize) * stride + x);
+            let mut p0 = pic.luma_sample(((edge_y - 1) as usize) * stride + x);
+            let mut q0 = pic.luma_sample((edge_y as usize) * stride + x);
+            let mut q1 = pic.luma_sample(((edge_y + 1) as usize) * stride + x);
+            let mut q2 = pic.luma_sample(((edge_y + 2) as usize) * stride + x);
             filter_edge(
                 Plane::Luma,
                 EdgeSamples {
@@ -10655,12 +10718,12 @@ fn filter_horizontal_edge_luma(
                 },
                 params,
             );
-            pic.luma[((edge_y - 3) as usize) * stride + x] = p2;
-            pic.luma[((edge_y - 2) as usize) * stride + x] = p1;
-            pic.luma[((edge_y - 1) as usize) * stride + x] = p0;
-            pic.luma[((edge_y) as usize) * stride + x] = q0;
-            pic.luma[((edge_y + 1) as usize) * stride + x] = q1;
-            pic.luma[((edge_y + 2) as usize) * stride + x] = q2;
+            pic.set_luma_sample(((edge_y - 3) as usize) * stride + x, p2);
+            pic.set_luma_sample(((edge_y - 2) as usize) * stride + x, p1);
+            pic.set_luma_sample(((edge_y - 1) as usize) * stride + x, p0);
+            pic.set_luma_sample((edge_y as usize) * stride + x, q0);
+            pic.set_luma_sample(((edge_y + 1) as usize) * stride + x, q1);
+            pic.set_luma_sample(((edge_y + 2) as usize) * stride + x, q2);
         }
         return;
     }
@@ -10730,14 +10793,16 @@ fn filter_chroma_vertical_rows(
         filter_offset_b: beta_off,
         bit_depth,
     };
-    // Fast in-bounds path for the chroma edge.
+    // Fast in-bounds path for the chroma edge. Widen only this short
+    // working window, then compact the filtered samples on write-back.
     if edge_x >= 4 && edge_x + 4 <= cw && y0 >= 0 && y0 + rows <= ch {
         let stride = cw as usize;
         let base_x = (edge_x - 4) as usize;
-        let buf: &mut [i32] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
         for dy in 0..rows {
             let y = (y0 + dy) as usize;
-            let row = &mut buf[y * stride + base_x..y * stride + base_x + 8];
+            let start = y * stride + base_x;
+            let mut row = [0i32; 8];
+            pic.copy_chroma_range_to_i32(plane, start, &mut row);
             let p3 = row[0];
             let q3 = row[7];
             let mut p2 = row[1];
@@ -10765,6 +10830,7 @@ fn filter_chroma_vertical_rows(
             row[3] = p0;
             row[4] = q0;
             row[5] = q1;
+            pic.copy_chroma_range_from_i32(plane, start, &row);
         }
         return;
     }
@@ -10847,20 +10913,20 @@ fn filter_chroma_horizontal_cols(
         filter_offset_b: beta_off,
         bit_depth,
     };
-    // Fast in-bounds path.
+    // Fast in-bounds path. The samples are strided vertically, so widen the
+    // eight scalar values into i32 temporaries and compact only the updates.
     if x0 >= 0 && x0 + cols <= cw && edge_y >= 4 && edge_y + 4 <= ch {
         let stride = cw as usize;
-        let buf: &mut [i32] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
         for dx in 0..cols {
             let x = (x0 + dx) as usize;
-            let p3 = buf[((edge_y - 4) as usize) * stride + x];
-            let q3 = buf[((edge_y + 3) as usize) * stride + x];
-            let mut p2 = buf[((edge_y - 3) as usize) * stride + x];
-            let mut p1 = buf[((edge_y - 2) as usize) * stride + x];
-            let mut p0 = buf[((edge_y - 1) as usize) * stride + x];
-            let mut q0 = buf[((edge_y) as usize) * stride + x];
-            let mut q1 = buf[((edge_y + 1) as usize) * stride + x];
-            let mut q2 = buf[((edge_y + 2) as usize) * stride + x];
+            let p3 = pic.chroma_sample(plane, ((edge_y - 4) as usize) * stride + x);
+            let q3 = pic.chroma_sample(plane, ((edge_y + 3) as usize) * stride + x);
+            let mut p2 = pic.chroma_sample(plane, ((edge_y - 3) as usize) * stride + x);
+            let mut p1 = pic.chroma_sample(plane, ((edge_y - 2) as usize) * stride + x);
+            let mut p0 = pic.chroma_sample(plane, ((edge_y - 1) as usize) * stride + x);
+            let mut q0 = pic.chroma_sample(plane, (edge_y as usize) * stride + x);
+            let mut q1 = pic.chroma_sample(plane, ((edge_y + 1) as usize) * stride + x);
+            let mut q2 = pic.chroma_sample(plane, ((edge_y + 2) as usize) * stride + x);
             filter_edge(
                 Plane::Chroma,
                 EdgeSamples {
@@ -10875,10 +10941,10 @@ fn filter_chroma_horizontal_cols(
                 },
                 params,
             );
-            buf[((edge_y - 2) as usize) * stride + x] = p1;
-            buf[((edge_y - 1) as usize) * stride + x] = p0;
-            buf[((edge_y) as usize) * stride + x] = q0;
-            buf[((edge_y + 1) as usize) * stride + x] = q1;
+            pic.set_chroma_sample(plane, ((edge_y - 2) as usize) * stride + x, p1);
+            pic.set_chroma_sample(plane, ((edge_y - 1) as usize) * stride + x, p0);
+            pic.set_chroma_sample(plane, (edge_y as usize) * stride + x, q0);
+            pic.set_chroma_sample(plane, ((edge_y + 1) as usize) * stride + x, q1);
         }
         return;
     }
@@ -11973,7 +12039,7 @@ mod tests {
         // We just confirm the two pictures are not equal: the filter
         // did something when enabled. A finer per-sample assertion
         // would require replicating the exact filter output here.
-        let changed = pic_on.luma != pic_off.luma;
+        let changed = pic_on.luma_values() != pic_off.luma_values();
         // I_PCM MBs with QP_Y = SliceQPY = 46 (filter tables active) and
         // bS = 4 at the MB edge should alter samples near x=15/16 at
         // least for one row.
@@ -12015,8 +12081,8 @@ mod tests {
                 info.qp_y = 46;
             }
         }
-        let before_cb: Vec<i32> = pic.cb.clone();
-        let before_cr: Vec<i32> = pic.cr.clone();
+        let before_cb = pic.cb_values();
+        let before_cr = pic.cr_values();
         deblock_plane_chroma_444(
             &mut pic,
             &grid,
@@ -12030,13 +12096,15 @@ mod tests {
         );
         // The Cb/Cr columns adjacent to the x=16 edge must have changed.
         let cw = pic.chroma_width() as usize;
+        let after_cb = pic.cb_values();
+        let after_cr = pic.cr_values();
         let edge_changed_cb = (0..16).any(|y| {
             let row = y * cw;
-            pic.cb[row + 15] != before_cb[row + 15] || pic.cb[row + 16] != before_cb[row + 16]
+            after_cb[row + 15] != before_cb[row + 15] || after_cb[row + 16] != before_cb[row + 16]
         });
         let edge_changed_cr = (0..16).any(|y| {
             let row = y * cw;
-            pic.cr[row + 15] != before_cr[row + 15] || pic.cr[row + 16] != before_cr[row + 16]
+            after_cr[row + 15] != before_cr[row + 15] || after_cr[row + 16] != before_cr[row + 16]
         });
         assert!(edge_changed_cb, "Cb chroma edge not filtered at 4:4:4");
         assert!(edge_changed_cr, "Cr chroma edge not filtered at 4:4:4");
@@ -12046,7 +12114,7 @@ mod tests {
         // edges, not the whole plane.
         let interior_unchanged = (0..16).all(|y| {
             let row = y * cw;
-            pic.cb[row + 1] == before_cb[row + 1]
+            after_cb[row + 1] == before_cb[row + 1]
         });
         assert!(
             interior_unchanged,
@@ -12082,7 +12150,7 @@ mod tests {
                 info.ref_poc_l0 = [0; 4];
             }
         }
-        let before_cb = pic.cb.clone();
+        let before_cb = pic.cb_values();
         deblock_plane_chroma_444(
             &mut pic,
             &grid,
@@ -12095,7 +12163,8 @@ mod tests {
             &[false, false],
         );
         assert_eq!(
-            pic.cb, before_cb,
+            pic.cb_values(),
+            before_cb,
             "bS=0 chroma edge must not be filtered at 4:4:4"
         );
     }

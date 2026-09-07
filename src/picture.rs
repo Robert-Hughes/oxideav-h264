@@ -1,21 +1,23 @@
-//! Picture sample buffer for a decoded frame/field.
+//! H.264 decoded-picture storage and reference metadata.
 //!
-//! Holds luma + chroma sample planes sized from the active SPS.
-//! Samples are stored as `i32` to accommodate bit_depth up to 14; the
-//! actual value range is `0..(1 << bit_depth)`.
+//! Reconstructed samples are stored in their final unsigned representation:
+//! `u8` for 8-bit pictures and little-endian `u16` containers for 9..=14-bit
+//! pictures. Transform, prediction and filtering arithmetic remains `i32`; only
+//! values already clipped to the legal sample range are committed here.
 //!
-//! Spec references:
-//! * §6.2 — ChromaArrayType and sample-array layout.
-//! * §7.4.2.1.1 — picture-size derivations (PicWidthInSamplesL,
-//!   PicHeightInSamplesL, MbWidthC, MbHeightC).
-//! * §5.7 — Clip3 / Clip1 used when sampling outside the picture
-//!   (returns the nearest edge sample, per §8.4.2.2.1).
-//!
-//! Clean-room: derived only from ITU-T Rec. H.264 (08/2024).
+//! A picture is mutable while reconstruction/deblocking is in progress.
+//! [`Picture::freeze`] turns the exact same pooled allocation into an immutable
+//! arena frame which can later be retained simultaneously by the H.264 DPB and
+//! by an application [`oxideav_core::FrameLease`].
 
-/// §8.4.1.2.1 Table 8-7 — `PicCodingStruct( X )` of a decoded picture:
-/// FLD (coded with `field_pic_flag` = 1), FRM (frame,
-/// `mb_adaptive_frame_field_flag` = 0) or AFRM (MBAFF frame).
+use std::fmt;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+
+use oxideav_core::arena::sync::{ArenaPool, Frame as ArenaFrame, FrameHeader, VideoFrameBuilder};
+use oxideav_core::{PixelFormat, Result};
+
+/// §8.4.1.2.1 Table 8-7 — `PicCodingStruct( X )` of a decoded picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PicCodingStruct {
     #[default]
@@ -24,106 +26,37 @@ pub enum PicCodingStruct {
     Afrm,
 }
 
-/// A decoded picture sample buffer.
+/// H.264-only metadata associated with decoded samples.
 ///
-/// `luma` is a row-major `i32` buffer of size
-/// `width_in_samples * height_in_samples`. Chroma planes `cb` / `cr`
-/// are sized from `chroma_array_type` (and are empty for monochrome).
-///
-/// POC and frame_num are set by the caller after reconstruction.
+/// Pixel ownership is deliberately absent: cloning this value never copies a
+/// decoded picture. [`Picture`] dereferences to this type so existing codec
+/// bookkeeping can continue to use `pic.pic_order_cnt`, `pic.mv_l0_grid`, etc.
 #[derive(Debug, Clone)]
-pub struct Picture {
+pub struct H264PictureMeta {
     pub width_in_samples: u32,
     pub height_in_samples: u32,
-    /// §6.2 — 0 = monochrome (or separate_colour_plane_flag),
-    /// 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4.
     pub chroma_array_type: u32,
     pub bit_depth_luma: u32,
     pub bit_depth_chroma: u32,
-    pub luma: Vec<i32>,
-    pub cb: Vec<i32>,
-    pub cr: Vec<i32>,
-    /// §8.2.5.2 — set on the placeholder pictures synthesised to fill a
-    /// gap in `frame_num`. Their samples are "not available for
-    /// prediction of other pictures": a conforming bitstream never
-    /// samples a non-existing frame, so motion compensation refuses to
-    /// (reconstructing from invented placeholder samples would silently
-    /// fabricate picture content).
     pub non_existing: bool,
-    /// Set by caller after reconstruction.
     pub pic_order_cnt: i32,
     pub frame_num: u32,
-    /// §8.4.1.2.3 — co-located motion data for temporal-direct
-    /// derivation. When populated, `mv_l0_grid[mb_addr * 16 + blk4]`
-    /// holds the list-0 MV (in 1/4-pel units) of the 4x4 block, and
-    /// `ref_idx_l0_grid[mb_addr * 4 + blk8]` holds the list-0 refIdx
-    /// (−1 when the list is not used). `is_intra_grid[mb_addr]` flags
-    /// intra-coded macroblocks (colZeroFlag wants to treat intra as
-    /// "L0 unavailable").
-    ///
-    /// The grids are sized as:
-    ///   - `mv_*_grid`: `width_in_mbs * height_in_mbs * 16`
-    ///   - `ref_idx_*_grid`: `width_in_mbs * height_in_mbs * 4`
-    ///   - `is_intra_grid`: `width_in_mbs * height_in_mbs`
-    ///
-    /// Absent for I-only pictures or for pictures whose motion data is
-    /// not needed by later B slices.
     pub mb_width_in_picture: u32,
     pub mv_l0_grid: Vec<(i16, i16)>,
     pub mv_l1_grid: Vec<(i16, i16)>,
     pub ref_idx_l0_grid: Vec<i8>,
     pub ref_idx_l1_grid: Vec<i8>,
     pub is_intra_grid: Vec<bool>,
-    /// §8.4.1.2.3 — per-slice snapshot of POCs in the slice's
-    /// RefPicList0 that was used when this picture was decoded.
-    /// Needed by a later B-slice's temporal-direct derivation to map
-    /// this picture's colocated block's refIdxL0 back to a concrete
-    /// picture identity (its POC), which is then matched against the
-    /// current slice's RefPicList0 to produce refIdxL0 for the current
-    /// block (MapColToList0 of eq. 8-191).
-    ///
-    /// Snapshotted at reconstruction time per slice; if the picture
-    /// comprises multiple slices we keep the first non-empty value
-    /// (all slices of a coded picture share reference pictures modulo
-    /// RPLM — near-enough for I/P pictures used as colocated).
     pub ref_list_0_pocs: Vec<i32>,
     pub ref_list_1_pocs: Vec<i32>,
-    /// §8.4.1.2.3 — whether the picture at position `k` in
-    /// `ref_list_0_pocs` / `ref_list_1_pocs` is a long-term reference.
-    /// Parallel arrays to the `_pocs` arrays above. Needed for the
-    /// eq. 8-195 short-circuit.
     pub ref_list_0_longterm: Vec<bool>,
     pub ref_list_1_longterm: Vec<bool>,
-    /// §8.4.1.2.1 Table 8-7 — how this picture was coded (FLD / FRM /
-    /// AFRM). Drives the Table 8-8 mbAddrCol / yM / vertMvScale rows
-    /// when this picture serves as `colPic`.
     pub coding_struct: PicCodingStruct,
-    /// §7.4.3 — for a coded FIELD picture, its parity (`true` =
-    /// bottom). Meaningless for frames.
     pub is_bottom_field: bool,
-    /// §8.2.1 — TopFieldOrderCnt / BottomFieldOrderCnt of the coded
-    /// picture (for a coded field only its own parity is meaningful).
-    /// Needed for the §8.4.1.2.3 per-field tb/td distances when the
-    /// current macroblock is a field macroblock of an MBAFF frame.
     pub top_field_order_cnt: i32,
     pub bottom_field_order_cnt: i32,
-    /// §6.4.12.2 / Table 8-8 — per-MB `mb_field_decoding_flag`
-    /// snapshot for AFRM pictures (`fieldDecodingFlagX` of the
-    /// co-located macroblock). Empty for FLD / FRM pictures.
     pub mb_field_flags: Vec<bool>,
-    /// §8.4.1.2.1 Table 8-6 — set on a [`Picture::field_view`] of a
-    /// stored FRAME (the view's parity). When `RefPicList1[ 0 ]` of a
-    /// field slice resolves to such a view, colPic is "the frame
-    /// containing RefPicList1[ 0 ]": the view carries the FRAME's
-    /// motion grids / coding struct / reference-list snapshots so the
-    /// temporal-direct derivation can address it in frame coordinates.
     pub view_of_frame_parity: Option<u8>,
-    /// §8.4.1.2.3 MapColToList0 — picture-identity snapshot of the
-    /// reference lists active when this picture was decoded: per-entry
-    /// DPB storage key, field parity (`None` for frame/pair units) and
-    /// the frame-level UNIT key containing the entry (for a coded
-    /// field of a complementary pair: the pair's unit key; for frame
-    /// units: the entry's own key). Parallel to `ref_list_*_pocs`.
     pub ref_list_0_keys: Vec<u32>,
     pub ref_list_0_parities: Vec<Option<u8>>,
     pub ref_list_0_unit_keys: Vec<u32>,
@@ -132,32 +65,20 @@ pub struct Picture {
     pub ref_list_1_unit_keys: Vec<u32>,
 }
 
-impl Picture {
-    /// Allocate a zero-filled picture of the requested geometry.
-    pub fn new(
+impl H264PictureMeta {
+    fn new(
         width_in_samples: u32,
         height_in_samples: u32,
         chroma_array_type: u32,
         bit_depth_luma: u32,
         bit_depth_chroma: u32,
     ) -> Self {
-        let luma_len = (width_in_samples as usize) * (height_in_samples as usize);
-        // §6.2 / Table 6-1 — MbWidthC / MbHeightC.
-        //   ChromaArrayType == 0: no chroma.
-        //   ChromaArrayType == 1 (4:2:0): MbWidthC=8, MbHeightC=8 → half W/H.
-        //   ChromaArrayType == 2 (4:2:2): MbWidthC=8, MbHeightC=16 → half W, full H.
-        //   ChromaArrayType == 3 (4:4:4): MbWidthC=16, MbHeightC=16 → full W, full H.
-        let (cw, ch) = chroma_dims(chroma_array_type, width_in_samples, height_in_samples);
-        let chroma_len = (cw as usize) * (ch as usize);
         Self {
             width_in_samples,
             height_in_samples,
             chroma_array_type,
             bit_depth_luma,
             bit_depth_chroma,
-            luma: vec![0; luma_len],
-            cb: vec![0; chroma_len],
-            cr: vec![0; chroma_len],
             non_existing: false,
             pic_order_cnt: 0,
             frame_num: 0,
@@ -185,19 +106,483 @@ impl Picture {
             ref_list_1_unit_keys: Vec::new(),
         }
     }
+}
 
-    /// §8.4.2.1 / §8.2.4.2.5 — extract one parity field of this FRAME
-    /// picture as a standalone half-height picture (top field = even
-    /// sample rows of every plane, bottom = odd rows; the chroma planes
-    /// of every interlace-capable format have even height and split by
-    /// the same row parity). Used when a coded FIELD picture references
-    /// a field of a picture that was stored as a frame. The FRAME's
-    /// motion / colocated grids, per-MB field flags, coding struct and
-    /// reference-list identity snapshots are carried on the view (in
-    /// FRAME addressing) with `view_of_frame_parity` marking it, so
-    /// the §8.4.1.2.1 Table 8-6 "colPic = the frame containing
-    /// RefPicList1[ 0 ]" row can address the containing frame. The
-    /// caller stamps `pic_order_cnt` with the FIELD's own order count.
+enum PictureStorage {
+    Writable8(VideoFrameBuilder<u8>),
+    Writable16(VideoFrameBuilder<u16>),
+    Frozen(ArenaFrame),
+}
+
+/// Typed read-only plane used by motion-compensation kernels.
+#[derive(Clone, Copy)]
+pub(crate) enum SamplePlane<'a> {
+    U8(&'a [u8]),
+    U16(&'a [u16]),
+}
+
+impl SamplePlane<'_> {
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::U8(v) => v.len(),
+            Self::U16(v) => v.len(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn sample(self, index: usize) -> i32 {
+        match self {
+            Self::U8(v) => v[index] as i32,
+            Self::U16(v) => u16::from_le(v[index]) as i32,
+        }
+    }
+    pub(crate) fn offset(self, offset: usize) -> Self {
+        match self {
+            Self::U8(v) => Self::U8(&v[offset..]),
+            Self::U16(v) => Self::U16(&v[offset..]),
+        }
+    }
+}
+
+/// Mutable-then-frozen decoded picture.
+pub struct Picture {
+    storage: Option<PictureStorage>,
+    meta: H264PictureMeta,
+}
+
+impl fmt::Debug for Picture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Picture")
+            .field("meta", &self.meta)
+            .field("frozen", &self.is_frozen())
+            .finish()
+    }
+}
+
+impl Deref for Picture {
+    type Target = H264PictureMeta;
+
+    fn deref(&self) -> &Self::Target {
+        &self.meta
+    }
+}
+
+impl DerefMut for Picture {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.meta
+    }
+}
+
+impl Picture {
+    /// Allocate a standalone picture. Primarily for tests and the approved
+    /// PAFF/SCP copy fallbacks; production decode should use [`Self::new_in`].
+    pub fn new(
+        width_in_samples: u32,
+        height_in_samples: u32,
+        chroma_array_type: u32,
+        bit_depth_luma: u32,
+        bit_depth_chroma: u32,
+    ) -> Self {
+        let cap = Self::required_bytes(
+            width_in_samples,
+            height_in_samples,
+            chroma_array_type,
+            bit_depth_luma,
+            bit_depth_chroma,
+        )
+        .saturating_add(3 * 64);
+        let pool = ArenaPool::new(1, cap);
+        Self::new_in(
+            &pool,
+            width_in_samples,
+            height_in_samples,
+            chroma_array_type,
+            bit_depth_luma,
+            bit_depth_chroma,
+        )
+        .expect("standalone H.264 picture allocation")
+    }
+
+    /// Allocate reconstruction planes from a reusable arena pool.
+    pub fn new_in(
+        pool: &Arc<ArenaPool>,
+        width_in_samples: u32,
+        height_in_samples: u32,
+        chroma_array_type: u32,
+        bit_depth_luma: u32,
+        bit_depth_chroma: u32,
+    ) -> Result<Self> {
+        let (cw, ch) = chroma_dims(chroma_array_type, width_in_samples, height_in_samples);
+        let luma_len = width_in_samples as usize * height_in_samples as usize;
+        let chroma_len = cw as usize * ch as usize;
+        let plane_elements = if chroma_array_type == 0 {
+            vec![luma_len]
+        } else {
+            vec![luma_len, chroma_len, chroma_len]
+        };
+        let wide = bit_depth_luma.max(bit_depth_chroma) > 8;
+        let bytes_per_sample = if wide { 2 } else { 1 };
+        let mut strides = vec![width_in_samples as usize * bytes_per_sample];
+        if chroma_array_type != 0 {
+            strides.push(cw as usize * bytes_per_sample);
+            strides.push(cw as usize * bytes_per_sample);
+        }
+        let arena = pool.lease()?;
+        let storage = if wide {
+            PictureStorage::Writable16(VideoFrameBuilder::<u16>::new(
+                arena,
+                &plane_elements,
+                &strides,
+            )?)
+        } else {
+            PictureStorage::Writable8(VideoFrameBuilder::<u8>::new(
+                arena,
+                &plane_elements,
+                &strides,
+            )?)
+        };
+        Ok(Self {
+            storage: Some(storage),
+            meta: H264PictureMeta::new(
+                width_in_samples,
+                height_in_samples,
+                chroma_array_type,
+                bit_depth_luma,
+                bit_depth_chroma,
+            ),
+        })
+    }
+
+    pub fn required_bytes(
+        width: u32,
+        height: u32,
+        chroma_array_type: u32,
+        bit_depth_luma: u32,
+        bit_depth_chroma: u32,
+    ) -> usize {
+        let (cw, ch) = chroma_dims(chroma_array_type, width, height);
+        let samples = width as usize * height as usize + 2 * cw as usize * ch as usize;
+        let bytes_per_sample = if bit_depth_luma.max(bit_depth_chroma) > 8 {
+            2
+        } else {
+            1
+        };
+        samples.saturating_mul(bytes_per_sample)
+    }
+
+    pub fn is_frozen(&self) -> bool {
+        matches!(self.storage, Some(PictureStorage::Frozen(_)))
+    }
+
+    fn sample_plane(&self, plane: usize) -> SamplePlane<'_> {
+        match self.storage.as_ref().expect("picture storage") {
+            PictureStorage::Writable8(b) => SamplePlane::U8(b.plane(plane).expect("picture plane")),
+            PictureStorage::Writable16(b) => {
+                SamplePlane::U16(b.plane(plane).expect("picture plane"))
+            }
+            PictureStorage::Frozen(frame) => {
+                let bytes = frame.plane(plane).expect("picture plane");
+                if self.bit_depth_luma.max(self.bit_depth_chroma) <= 8 {
+                    SamplePlane::U8(bytes)
+                } else {
+                    debug_assert_eq!(bytes.len() % 2, 0);
+                    debug_assert_eq!((bytes.as_ptr() as usize) % std::mem::align_of::<u16>(), 0);
+                    // SAFETY: H.264 wide frames originate from
+                    // `VideoFrameBuilder<u16>` and therefore retain u16 alignment.
+                    SamplePlane::U16(unsafe {
+                        std::slice::from_raw_parts(bytes.as_ptr().cast::<u16>(), bytes.len() / 2)
+                    })
+                }
+            }
+        }
+    }
+
+    pub(crate) fn luma_plane(&self) -> SamplePlane<'_> {
+        self.sample_plane(0)
+    }
+
+    pub(crate) fn cb_plane(&self) -> SamplePlane<'_> {
+        self.sample_plane(1)
+    }
+
+    pub(crate) fn cr_plane(&self) -> SamplePlane<'_> {
+        self.sample_plane(2)
+    }
+
+    #[inline]
+    pub fn luma_sample(&self, index: usize) -> i32 {
+        self.sample_plane(0).sample(index)
+    }
+
+    #[inline]
+    pub fn cb_sample(&self, index: usize) -> i32 {
+        self.sample_plane(1).sample(index)
+    }
+
+    #[inline]
+    pub fn cr_sample(&self, index: usize) -> i32 {
+        self.sample_plane(2).sample(index)
+    }
+
+    fn set_plane_sample(&mut self, plane: usize, index: usize, value: i32, bit_depth: u32) {
+        let hi = (1i32 << bit_depth) - 1;
+        let value = value.clamp(0, hi);
+        match self.storage.as_mut().expect("picture storage") {
+            PictureStorage::Writable8(b) => {
+                b.plane_mut(plane).expect("picture plane")[index] = value as u8;
+            }
+            PictureStorage::Writable16(b) => {
+                b.plane_mut(plane).expect("picture plane")[index] = (value as u16).to_le();
+            }
+            PictureStorage::Frozen(_) => panic!("attempted to mutate frozen H.264 picture"),
+        }
+    }
+
+    pub(crate) fn set_luma_sample(&mut self, index: usize, value: i32) {
+        self.set_plane_sample(0, index, value, self.bit_depth_luma);
+    }
+
+    pub(crate) fn set_cb_sample(&mut self, index: usize, value: i32) {
+        self.set_plane_sample(1, index, value, self.bit_depth_chroma);
+    }
+
+    pub(crate) fn set_cr_sample(&mut self, index: usize, value: i32) {
+        self.set_plane_sample(2, index, value, self.bit_depth_chroma);
+    }
+
+    pub(crate) fn chroma_sample(&self, plane: u8, index: usize) -> i32 {
+        if plane == 0 {
+            self.cb_sample(index)
+        } else {
+            self.cr_sample(index)
+        }
+    }
+
+    pub(crate) fn set_chroma_sample(&mut self, plane: u8, index: usize, value: i32) {
+        if plane == 0 {
+            self.set_cb_sample(index, value);
+        } else {
+            self.set_cr_sample(index, value);
+        }
+    }
+
+    fn copy_plane_to_i32(&self, plane: usize, start: usize, dst: &mut [i32]) {
+        let len = dst.len();
+        match self.sample_plane(plane) {
+            SamplePlane::U8(src) => {
+                for (out, &value) in dst.iter_mut().zip(&src[start..start + len]) {
+                    *out = value as i32;
+                }
+            }
+            SamplePlane::U16(src) => {
+                for (out, &value) in dst.iter_mut().zip(&src[start..start + len]) {
+                    *out = u16::from_le(value) as i32;
+                }
+            }
+        }
+    }
+
+    fn copy_plane_from_i32(&mut self, plane: usize, start: usize, src: &[i32], bit_depth: u32) {
+        let hi = (1i32 << bit_depth) - 1;
+        match self.storage.as_mut().expect("picture storage") {
+            PictureStorage::Writable8(builder) => {
+                let dst =
+                    &mut builder.plane_mut(plane).expect("picture plane")[start..start + src.len()];
+                for (dst, &value) in dst.iter_mut().zip(src) {
+                    *dst = value.clamp(0, hi) as u8;
+                }
+            }
+            PictureStorage::Writable16(builder) => {
+                let dst =
+                    &mut builder.plane_mut(plane).expect("picture plane")[start..start + src.len()];
+                for (dst, &value) in dst.iter_mut().zip(src) {
+                    *dst = (value.clamp(0, hi) as u16).to_le();
+                }
+            }
+            PictureStorage::Frozen(_) => panic!("attempted to mutate frozen H.264 picture"),
+        }
+    }
+
+    pub(crate) fn copy_luma_range_to_i32(&self, start: usize, dst: &mut [i32]) {
+        self.copy_plane_to_i32(0, start, dst);
+    }
+
+    pub(crate) fn copy_luma_range_from_i32(&mut self, start: usize, src: &[i32]) {
+        self.copy_plane_from_i32(0, start, src, self.bit_depth_luma);
+    }
+
+    pub(crate) fn copy_chroma_range_to_i32(&self, plane: u8, start: usize, dst: &mut [i32]) {
+        self.copy_plane_to_i32(usize::from(plane) + 1, start, dst);
+    }
+
+    pub(crate) fn copy_chroma_range_from_i32(&mut self, plane: u8, start: usize, src: &[i32]) {
+        self.copy_plane_from_i32(usize::from(plane) + 1, start, src, self.bit_depth_chroma);
+    }
+
+    pub(crate) fn copy_luma_to_i32(&self, dst: &mut [i32]) {
+        self.copy_plane_to_i32(0, 0, dst);
+    }
+
+    pub(crate) fn copy_cb_to_i32(&self, dst: &mut [i32]) {
+        if self.chroma_array_type == 0 {
+            debug_assert!(dst.is_empty());
+            return;
+        }
+        self.copy_plane_to_i32(1, 0, dst);
+    }
+
+    pub(crate) fn copy_cr_to_i32(&self, dst: &mut [i32]) {
+        if self.chroma_array_type == 0 {
+            debug_assert!(dst.is_empty());
+            return;
+        }
+        self.copy_plane_to_i32(2, 0, dst);
+    }
+
+    pub(crate) fn copy_luma_from_i32(&mut self, src: &[i32]) {
+        self.copy_plane_from_i32(0, 0, src, self.bit_depth_luma);
+    }
+
+    pub(crate) fn copy_cb_from_i32(&mut self, src: &[i32]) {
+        if self.chroma_array_type == 0 {
+            debug_assert!(src.is_empty());
+            return;
+        }
+        self.copy_plane_from_i32(1, 0, src, self.bit_depth_chroma);
+    }
+
+    pub(crate) fn copy_cr_from_i32(&mut self, src: &[i32]) {
+        if self.chroma_array_type == 0 {
+            debug_assert!(src.is_empty());
+            return;
+        }
+        self.copy_plane_from_i32(2, 0, src, self.bit_depth_chroma);
+    }
+
+    pub(crate) fn fill_luma(&mut self, value: i32) {
+        let len = self.luma_plane().len();
+        for i in 0..len {
+            self.set_luma_sample(i, value);
+        }
+    }
+
+    pub(crate) fn fill_cb(&mut self, value: i32) {
+        if self.chroma_array_type == 0 {
+            return;
+        }
+        let len = self.cb_plane().len();
+        for i in 0..len {
+            self.set_cb_sample(i, value);
+        }
+    }
+
+    pub(crate) fn fill_cr(&mut self, value: i32) {
+        if self.chroma_array_type == 0 {
+            return;
+        }
+        let len = self.cr_plane().len();
+        for i in 0..len {
+            self.set_cr_sample(i, value);
+        }
+    }
+
+    /// Freeze the current sample allocation into the application/DPB format.
+    pub fn freeze(&mut self, pts: Option<i64>) -> Result<ArenaFrame> {
+        if let Some(PictureStorage::Frozen(frame)) = self.storage.as_ref() {
+            return Ok(Arc::clone(frame));
+        }
+        let storage = self.storage.take().expect("picture storage");
+        let mut header = FrameHeader::new(
+            self.width_in_samples,
+            self.height_in_samples,
+            self.pixel_format(),
+            pts,
+        );
+        if let Some(bits) = self.significant_bits_metadata() {
+            header = header.with_significant_bits(&bits)?;
+        }
+        let frame = match storage {
+            PictureStorage::Writable8(b) => b.freeze(header)?,
+            PictureStorage::Writable16(b) => b.freeze(header)?,
+            PictureStorage::Frozen(frame) => frame,
+        };
+        self.storage = Some(PictureStorage::Frozen(Arc::clone(&frame)));
+        Ok(frame)
+    }
+
+    pub fn frozen_frame(&self) -> Option<&ArenaFrame> {
+        match self.storage.as_ref()? {
+            PictureStorage::Frozen(frame) => Some(frame),
+            _ => None,
+        }
+    }
+
+    pub fn pixel_format(&self) -> PixelFormat {
+        use PixelFormat::*;
+        let depth = self.bit_depth_luma.max(self.bit_depth_chroma);
+        match (self.chroma_array_type, depth) {
+            (0, 0..=8) => Gray8,
+            (0, 9..=10) => Gray10Le,
+            (0, 11..=12) => Gray12Le,
+            (0, _) => Gray16Le,
+            (1, 0..=8) => Yuv420P,
+            (2, 0..=8) => Yuv422P,
+            (3, 0..=8) => Yuv444P,
+            (1, 9..=10) => Yuv420P10Le,
+            (2, 9..=10) => Yuv422P10Le,
+            (3, 9..=10) => Yuv444P10Le,
+            (1, 11..=12) => Yuv420P12Le,
+            (2, 11..=12) => Yuv422P12Le,
+            (3, 11..=12) => Yuv444P12Le,
+            (1, _) => Yuv420P16Le,
+            (2, _) => Yuv422P16Le,
+            (3, _) => Yuv444P16Le,
+            _ => Gray8,
+        }
+    }
+
+    /// Exact per-plane precision when the public pixel format's nominal depth
+    /// does not fully describe this H.264 picture. Common 8/10/12-bit streams
+    /// need no side channel; 9/11/13/14-bit or mixed-depth pictures do.
+    pub(crate) fn significant_bits_metadata(&self) -> Option<Vec<u8>> {
+        let format_depth = match self.bit_depth_luma.max(self.bit_depth_chroma) {
+            0..=8 => 8,
+            9..=10 => 10,
+            11..=12 => 12,
+            _ => 16,
+        };
+        let mut bits = vec![self.bit_depth_luma as u8];
+        if self.chroma_array_type != 0 {
+            bits.push(self.bit_depth_chroma as u8);
+            bits.push(self.bit_depth_chroma as u8);
+        }
+        (!bits.iter().all(|&bits| bits == format_depth)).then_some(bits)
+    }
+
+    /// Explicit deep copy used only by the approved PAFF/SCP fallback paths
+    /// and compatibility tests while the DPB hand-off is being migrated.
+    pub fn deep_copy(&self) -> Picture {
+        let mut out = Picture::new(
+            self.width_in_samples,
+            self.height_in_samples,
+            self.chroma_array_type,
+            self.bit_depth_luma,
+            self.bit_depth_chroma,
+        );
+        for i in 0..self.luma_plane().len() {
+            out.set_luma_sample(i, self.luma_sample(i));
+        }
+        if self.chroma_array_type != 0 {
+            for i in 0..self.cb_plane().len() {
+                out.set_cb_sample(i, self.cb_sample(i));
+                out.set_cr_sample(i, self.cr_sample(i));
+            }
+        }
+        out.meta = self.meta.clone();
+        out
+    }
+
+    /// PAFF fallback: materialise one parity field into its own compact picture.
     pub fn field_view(&self, bottom: bool) -> Picture {
         let mut out = Picture::new(
             self.width_in_samples,
@@ -206,55 +591,31 @@ impl Picture {
             self.bit_depth_luma,
             self.bit_depth_chroma,
         );
-        let take_rows = |src: &[i32], width: usize, height: usize| -> Vec<i32> {
-            let mut v = Vec::with_capacity(width * height / 2);
-            for row in (usize::from(bottom)..height).step_by(2) {
-                v.extend_from_slice(&src[row * width..(row + 1) * width]);
+        let w = self.width_in_samples as usize;
+        for (dst_row, src_row) in (usize::from(bottom)..self.height_in_samples as usize)
+            .step_by(2)
+            .enumerate()
+        {
+            for x in 0..w {
+                out.set_luma_sample(dst_row * w + x, self.luma_sample(src_row * w + x));
             }
-            v
-        };
-        out.luma = take_rows(
-            &self.luma,
-            self.width_in_samples as usize,
-            self.height_in_samples as usize,
-        );
+        }
         let cw = self.chroma_width() as usize;
         let ch = self.chroma_height() as usize;
         if ch > 0 {
-            out.cb = take_rows(&self.cb, cw, ch);
-            out.cr = take_rows(&self.cr, cw, ch);
+            for (dst_row, src_row) in (usize::from(bottom)..ch).step_by(2).enumerate() {
+                for x in 0..cw {
+                    out.set_cb_sample(dst_row * cw + x, self.cb_sample(src_row * cw + x));
+                    out.set_cr_sample(dst_row * cw + x, self.cr_sample(src_row * cw + x));
+                }
+            }
         }
-        out.non_existing = self.non_existing;
-        out.frame_num = self.frame_num;
-        out.pic_order_cnt = self.pic_order_cnt;
-        // §8.4.1.2.1 — carry the FRAME's colocated-motion state so the
-        // view can serve as "the frame containing RefPicList1[ 0 ]"
-        // (Table 8-6, field_pic_flag == 1 row 1).
-        out.coding_struct = self.coding_struct;
-        out.top_field_order_cnt = self.top_field_order_cnt;
-        out.bottom_field_order_cnt = self.bottom_field_order_cnt;
-        out.mb_width_in_picture = self.mb_width_in_picture;
-        out.mv_l0_grid = self.mv_l0_grid.clone();
-        out.mv_l1_grid = self.mv_l1_grid.clone();
-        out.ref_idx_l0_grid = self.ref_idx_l0_grid.clone();
-        out.ref_idx_l1_grid = self.ref_idx_l1_grid.clone();
-        out.is_intra_grid = self.is_intra_grid.clone();
-        out.mb_field_flags = self.mb_field_flags.clone();
-        out.ref_list_0_pocs = self.ref_list_0_pocs.clone();
-        out.ref_list_1_pocs = self.ref_list_1_pocs.clone();
-        out.ref_list_0_longterm = self.ref_list_0_longterm.clone();
-        out.ref_list_1_longterm = self.ref_list_1_longterm.clone();
-        out.ref_list_0_keys = self.ref_list_0_keys.clone();
-        out.ref_list_0_parities = self.ref_list_0_parities.clone();
-        out.ref_list_0_unit_keys = self.ref_list_0_unit_keys.clone();
-        out.ref_list_1_keys = self.ref_list_1_keys.clone();
-        out.ref_list_1_parities = self.ref_list_1_parities.clone();
-        out.ref_list_1_unit_keys = self.ref_list_1_unit_keys.clone();
+        out.meta = self.meta.clone();
+        out.height_in_samples /= 2;
         out.view_of_frame_parity = Some(u8::from(bottom));
         out
     }
 
-    /// §6.2 — chroma plane width in samples.
     pub fn chroma_width(&self) -> u32 {
         chroma_dims(
             self.chroma_array_type,
@@ -264,7 +625,6 @@ impl Picture {
         .0
     }
 
-    /// §6.2 — chroma plane height in samples.
     pub fn chroma_height(&self) -> u32 {
         chroma_dims(
             self.chroma_array_type,
@@ -274,10 +634,6 @@ impl Picture {
         .1
     }
 
-    /// Clamped luma sample access — coordinates outside the picture are
-    /// clipped to the picture edge per §8.4.2.2.1 / Clip3 of §5.7. This
-    /// matches the neighbour-sampling rule used by intra prediction when
-    /// a neighbour is available but the sample index goes off-picture.
     #[inline]
     pub fn luma_at(&self, x: i32, y: i32) -> i32 {
         if self.width_in_samples == 0 || self.height_in_samples == 0 {
@@ -285,92 +641,58 @@ impl Picture {
         }
         let xi = clip3_i32(0, self.width_in_samples as i32 - 1, x) as usize;
         let yi = clip3_i32(0, self.height_in_samples as i32 - 1, y) as usize;
-        self.luma[yi * (self.width_in_samples as usize) + xi]
+        self.luma_sample(yi * self.width_in_samples as usize + xi)
     }
 
-    /// Clamped chroma Cb access (§6.2).
     #[inline]
     pub fn cb_at(&self, x: i32, y: i32) -> i32 {
-        let cw = self.chroma_width();
-        let ch = self.chroma_height();
+        let (cw, ch) = (self.chroma_width(), self.chroma_height());
         if cw == 0 || ch == 0 {
             return 0;
         }
         let xi = clip3_i32(0, cw as i32 - 1, x) as usize;
         let yi = clip3_i32(0, ch as i32 - 1, y) as usize;
-        self.cb[yi * (cw as usize) + xi]
+        self.cb_sample(yi * cw as usize + xi)
     }
 
-    /// Clamped chroma Cr access.
     #[inline]
     pub fn cr_at(&self, x: i32, y: i32) -> i32 {
-        let cw = self.chroma_width();
-        let ch = self.chroma_height();
+        let (cw, ch) = (self.chroma_width(), self.chroma_height());
         if cw == 0 || ch == 0 {
             return 0;
         }
         let xi = clip3_i32(0, cw as i32 - 1, x) as usize;
         let yi = clip3_i32(0, ch as i32 - 1, y) as usize;
-        self.cr[yi * (cw as usize) + xi]
+        self.cr_sample(yi * cw as usize + xi)
     }
 
-    /// Write a luma sample. Out-of-bounds writes are silently ignored
-    /// (callers should not produce such writes — this is a hard guard
-    /// for robustness during reconstruction edge handling).
     #[inline]
     pub fn set_luma(&mut self, x: i32, y: i32, v: i32) {
-        if x < 0 || y < 0 {
+        if x < 0 || y < 0 || x as u32 >= self.width_in_samples || y as u32 >= self.height_in_samples
+        {
             return;
         }
-        let xi = x as u32;
-        let yi = y as u32;
-        if xi >= self.width_in_samples || yi >= self.height_in_samples {
-            return;
-        }
-        let idx = (yi as usize) * (self.width_in_samples as usize) + (xi as usize);
-        self.luma[idx] = v;
+        self.set_luma_sample(y as usize * self.width_in_samples as usize + x as usize, v);
     }
 
-    /// Write a Cb sample.
     #[inline]
     pub fn set_cb(&mut self, x: i32, y: i32, v: i32) {
-        if x < 0 || y < 0 {
+        let (cw, ch) = (self.chroma_width(), self.chroma_height());
+        if x < 0 || y < 0 || x as u32 >= cw || y as u32 >= ch {
             return;
         }
-        let cw = self.chroma_width();
-        let ch = self.chroma_height();
-        let xi = x as u32;
-        let yi = y as u32;
-        if xi >= cw || yi >= ch {
-            return;
-        }
-        let idx = (yi as usize) * (cw as usize) + (xi as usize);
-        self.cb[idx] = v;
+        self.set_cb_sample(y as usize * cw as usize + x as usize, v);
     }
 
-    /// Write a Cr sample.
     #[inline]
     pub fn set_cr(&mut self, x: i32, y: i32, v: i32) {
-        if x < 0 || y < 0 {
+        let (cw, ch) = (self.chroma_width(), self.chroma_height());
+        if x < 0 || y < 0 || x as u32 >= cw || y as u32 >= ch {
             return;
         }
-        let cw = self.chroma_width();
-        let ch = self.chroma_height();
-        let xi = x as u32;
-        let yi = y as u32;
-        if xi >= cw || yi >= ch {
-            return;
-        }
-        let idx = (yi as usize) * (cw as usize) + (xi as usize);
-        self.cr[idx] = v;
+        self.set_cr_sample(y as usize * cw as usize + x as usize, v);
     }
 
-    /// Fetch the colocated L0 MV + refIdx for the 4x4 block at
-    /// (`mb_addr`, `blk4`). Returns `None` if motion data was not
-    /// populated for this picture (e.g. I-only pic) or `mb_addr` /
-    /// `blk4` is out of range.
-    ///
-    /// `blk4` uses the Figure 6-10 raster index (0..=15).
     pub fn colocated_l0(&self, mb_addr: u32, blk4: usize) -> Option<((i16, i16), i8, bool)> {
         if self.mv_l0_grid.is_empty() {
             return None;
@@ -388,9 +710,6 @@ impl Picture {
         Some((mv, ref_idx, is_intra))
     }
 
-    /// Fetch the colocated L1 MV + refIdx. Used when the colocated
-    /// block has predFlagL0 == 0 and the caller needs to fall back on
-    /// its L1 MV per §8.4.1.2.3.
     pub fn colocated_l1(&self, mb_addr: u32, blk4: usize) -> Option<((i16, i16), i8, bool)> {
         if self.mv_l1_grid.is_empty() {
             return None;
@@ -407,10 +726,34 @@ impl Picture {
             .unwrap_or(false);
         Some((mv, ref_idx, is_intra))
     }
+    #[cfg(test)]
+    pub(crate) fn luma_values(&self) -> Vec<i32> {
+        let mut values = vec![0i32; self.luma_plane().len()];
+        self.copy_luma_to_i32(&mut values);
+        values
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cb_values(&self) -> Vec<i32> {
+        if self.chroma_array_type == 0 {
+            return Vec::new();
+        }
+        let mut values = vec![0i32; self.cb_plane().len()];
+        self.copy_cb_to_i32(&mut values);
+        values
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cr_values(&self) -> Vec<i32> {
+        if self.chroma_array_type == 0 {
+            return Vec::new();
+        }
+        let mut values = vec![0i32; self.cr_plane().len()];
+        self.copy_cr_to_i32(&mut values);
+        values
+    }
 }
 
-/// §6.2 / Table 6-1 — chroma plane (width, height) given
-/// `chroma_array_type` and the luma frame dimensions.
 fn chroma_dims(chroma_array_type: u32, w: u32, h: u32) -> (u32, u32) {
     match chroma_array_type {
         0 => (0, 0),
@@ -421,8 +764,6 @@ fn chroma_dims(chroma_array_type: u32, w: u32, h: u32) -> (u32, u32) {
     }
 }
 
-/// §5.7 — `Clip3(x, y, z) = min(y, max(x, z))`. Inlined here so that
-/// Picture stays a self-contained module.
 #[inline]
 fn clip3_i32(x: i32, y: i32, z: i32) -> i32 {
     if z < x {
@@ -441,9 +782,9 @@ mod tests {
     #[test]
     fn allocation_monochrome() {
         let p = Picture::new(32, 16, 0, 8, 8);
-        assert_eq!(p.luma.len(), 32 * 16);
-        assert!(p.cb.is_empty());
-        assert!(p.cr.is_empty());
+        assert_eq!(p.luma_values().len(), 32 * 16);
+        assert!(p.cb_values().is_empty());
+        assert!(p.cr_values().is_empty());
         assert_eq!(p.chroma_width(), 0);
         assert_eq!(p.chroma_height(), 0);
     }
@@ -451,9 +792,9 @@ mod tests {
     #[test]
     fn allocation_yuv420() {
         let p = Picture::new(32, 16, 1, 8, 8);
-        assert_eq!(p.luma.len(), 32 * 16);
-        assert_eq!(p.cb.len(), 16 * 8);
-        assert_eq!(p.cr.len(), 16 * 8);
+        assert_eq!(p.luma_values().len(), 32 * 16);
+        assert_eq!(p.cb_values().len(), 16 * 8);
+        assert_eq!(p.cr_values().len(), 16 * 8);
         assert_eq!(p.chroma_width(), 16);
         assert_eq!(p.chroma_height(), 8);
     }
@@ -461,9 +802,9 @@ mod tests {
     #[test]
     fn allocation_yuv422() {
         let p = Picture::new(32, 16, 2, 8, 8);
-        assert_eq!(p.luma.len(), 32 * 16);
-        assert_eq!(p.cb.len(), 16 * 16);
-        assert_eq!(p.cr.len(), 16 * 16);
+        assert_eq!(p.luma_values().len(), 32 * 16);
+        assert_eq!(p.cb_values().len(), 16 * 16);
+        assert_eq!(p.cr_values().len(), 16 * 16);
         assert_eq!(p.chroma_width(), 16);
         assert_eq!(p.chroma_height(), 16);
     }
@@ -471,11 +812,47 @@ mod tests {
     #[test]
     fn allocation_yuv444() {
         let p = Picture::new(32, 16, 3, 10, 10);
-        assert_eq!(p.luma.len(), 32 * 16);
-        assert_eq!(p.cb.len(), 32 * 16);
-        assert_eq!(p.cr.len(), 32 * 16);
+        assert_eq!(p.luma_values().len(), 32 * 16);
+        assert_eq!(p.cb_values().len(), 32 * 16);
+        assert_eq!(p.cr_values().len(), 32 * 16);
         assert_eq!(p.chroma_width(), 32);
         assert_eq!(p.chroma_height(), 16);
+    }
+
+    #[test]
+    fn freeze_8bit_uses_plain_image_planes_without_precision_side_channel() {
+        let mut p = Picture::new(2, 2, 1, 8, 8);
+        p.set_luma(0, 0, 123);
+        p.set_cb(0, 0, 45);
+        p.set_cr(0, 0, 67);
+
+        let frame = p.freeze(Some(7)).expect("freeze 8-bit picture");
+        assert_eq!(frame.header().pixel_format, PixelFormat::Yuv420P);
+        assert_eq!(frame.header().presentation_timestamp, Some(7));
+        assert_eq!(frame.header().significant_bits(), None);
+        assert_eq!(frame.plane_count(), 3);
+        assert_eq!(frame.plane(0).unwrap()[0], 123);
+        assert_eq!(frame.plane(1).unwrap()[0], 45);
+        assert_eq!(frame.plane(2).unwrap()[0], 67);
+    }
+
+    #[test]
+    fn freeze_9bit_refines_10bit_container_with_exact_significant_bits() {
+        let mut p = Picture::new(2, 2, 1, 9, 9);
+        p.set_luma(0, 0, 0x101);
+        p.set_cb(0, 0, 0x1ff);
+        p.set_cr(0, 0, 0x155);
+
+        let frame = p.freeze(None).expect("freeze 9-bit picture");
+        assert_eq!(frame.header().pixel_format, PixelFormat::Yuv420P10Le);
+        assert_eq!(frame.header().significant_bits(), Some(&[9, 9, 9][..]));
+        assert_eq!(frame.plane_count(), 3);
+        let y = frame.plane(0).unwrap();
+        let cb = frame.plane(1).unwrap();
+        let cr = frame.plane(2).unwrap();
+        assert_eq!(u16::from_le_bytes([y[0], y[1]]), 0x101);
+        assert_eq!(u16::from_le_bytes([cb[0], cb[1]]), 0x1ff);
+        assert_eq!(u16::from_le_bytes([cr[0], cr[1]]), 0x155);
     }
 
     #[test]
@@ -526,6 +903,6 @@ mod tests {
         // Should not panic.
         p.set_luma(100, 100, 42);
         p.set_luma(-1, -1, 42);
-        assert_eq!(p.luma, vec![0; 16]);
+        assert_eq!(p.luma_values(), vec![0; 16]);
     }
 }
