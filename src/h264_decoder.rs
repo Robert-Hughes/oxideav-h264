@@ -44,10 +44,13 @@
 //! error on the first h264 packet.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
+use oxideav_core::arena::sync::ArenaPool;
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Error, Frame, FrameLease, Packet, Result, TimeBase, VideoFrame,
+    VideoPlane,
 };
 
 use crate::access_unit::AnnexBAccessUnitAssembler;
@@ -227,6 +230,9 @@ struct PendingDpSlice {
     part_c: Option<(Vec<u8>, (usize, u8))>,
 }
 
+const H264_PICTURE_POOL_MAX_ARENAS: usize = 32;
+const H264_PICTURE_ARENA_PADDING: usize = 3 * 64;
+
 pub struct H264CodecDecoder {
     codec_id: CodecId,
     /// NAL unit length-prefix size from `avcC`, when present. `None`
@@ -243,22 +249,13 @@ pub struct H264CodecDecoder {
     /// output. Diagnostic only — see [`Self::decode_error_count`].
     decode_errors: u64,
     eof: bool,
-    /// §C.2.2 / §C.4 — POC-ordered output DPB. Entries live here until
-    /// the bumping process releases them to `receive_frame`. Created
-    /// lazily (or recreated on SPS change) from the active SPS's VUI
-    /// bitstream restriction (§E.2.1), with an Annex A Table A-1
-    /// fallback when the VUI block is absent.
-    output_dpb: DpbOutput<VideoFrame>,
-    /// Pictures that have already been "bumped" from the DPB and are
-    /// waiting for `receive_frame`. This covers both:
-    /// 1. entries evicted by `DpbOutput::push` when the queue is full,
-    ///    and
-    /// 2. entries drained from the queue at an IDR / MMCO-5 so the
-    ///    previous sequence's pictures are delivered in POC order
-    ///    *before* the new sequence's first frames (§C.4).
-    ///
-    /// Also used to carry the `flush()` drain at EOF.
-    ready: VecDeque<VideoFrame>,
+    /// §C.2.2 / §C.4 — POC-ordered output DPB. The payload is an owned
+    /// retainable lease so decoded CPU arenas can remain shared with the
+    /// reference-picture store until the application releases them.
+    output_dpb: DpbOutput<FrameLease>,
+    /// Pictures that have already been "bumped" from the DPB and are waiting
+    /// for the next receive call. The lease is preserved unchanged here.
+    ready: VecDeque<FrameLease>,
     /// Packet-level pts passed on the most recent `send_packet`. We
     /// stamp the first frame produced from that packet with it.
     pending_pts: Option<i64>,
@@ -270,6 +267,10 @@ pub struct H264CodecDecoder {
 
     /// Long-lived reconstructed sample store keyed by shared DPB keys.
     ref_store: RefPicStore,
+    /// Reusable final-format sample allocations for ordinary frame-coded
+    /// software decode. The pool is recreated when the SPS changes geometry or
+    /// storage width; old leases keep their former pool alive as needed.
+    picture_pool: Arc<ArenaPool>,
 
     // ---- Shared H.264 byte/picture frontend --------------------------
     /// Optional Annex-B access-unit packetiser. AVCC retains its native
@@ -336,12 +337,13 @@ impl H264CodecDecoder {
             last_slice: None,
             decode_errors: 0,
             eof: false,
-            output_dpb: DpbOutput::<VideoFrame>::new(16, 16),
+            output_dpb: DpbOutput::<FrameLease>::new(16, 16),
             ready: VecDeque::new(),
             pending_pts: None,
             pending_dp: None,
             pending_time_base: TimeBase::new(1, 1),
             ref_store: RefPicStore::new(),
+            picture_pool: ArenaPool::new(H264_PICTURE_POOL_MAX_ARENAS, 1),
             au_assembler: AnnexBAccessUnitAssembler::default(),
             picture_frontend: H264PictureFrontend::new(),
             in_progress: None,
@@ -829,10 +831,15 @@ impl H264CodecDecoder {
             let cr = scp.queues[2].pop_front().expect("checked non-empty");
             let mut planes = y.planes;
             // Each sub-decoder emitted a single-plane monochrome frame
-            // of identical geometry (all three planes share the SPS).
+            // of identical geometry (all three planes share the SPS). SCP is
+            // the approved copy/materialisation fallback for this stage.
             planes.extend(cb.planes);
             planes.extend(cr.planes);
-            self.ready.push_back(VideoFrame { pts: y.pts, planes });
+            self.ready
+                .push_back(FrameLease::from_frame(Frame::Video(VideoFrame {
+                    pts: y.pts,
+                    planes,
+                })));
         }
         // Anti-OOM guard for NON-conforming streams: §7.4.1.2 requires
         // every access unit to carry all three colour planes, so the
@@ -1061,19 +1068,27 @@ impl H264CodecDecoder {
             let poc = prepared.poc;
             let structure = prepared.structure;
 
+            self.ensure_picture_pool_sized(&sps);
+
             // §8.2.5.2 synthetic references carry metadata in the shared
-            // frontend. The software backend supplies neutral sample buffers
+            // frontend. The software backend supplies neutral pooled samples
             // for their opaque keys; conforming streams never sample them.
             if !prepared.synthetic_references.is_empty() {
-                let gray = gray_picture(
-                    sps.pic_width_in_mbs() * 16,
-                    sps.frame_height_in_mbs() * 16,
-                    sps.chroma_array_type(),
-                    sps.bit_depth_luma_minus8 + 8,
-                    sps.bit_depth_chroma_minus8 + 8,
-                );
+                let bit_depth_y = sps.bit_depth_luma_minus8 + 8;
+                let bit_depth_c = sps.bit_depth_chroma_minus8 + 8;
                 for entry in &prepared.synthetic_references {
-                    self.ref_store.insert(entry.dpb_key, gray.deep_copy());
+                    let mut gray = self.allocate_picture(
+                        sps.pic_width_in_mbs() * 16,
+                        sps.frame_height_in_mbs() * 16,
+                        sps.chroma_array_type(),
+                        bit_depth_y,
+                        bit_depth_c,
+                    )?;
+                    gray.non_existing = true;
+                    gray.fill_luma(1 << bit_depth_y.saturating_sub(1));
+                    gray.fill_cb(1 << bit_depth_c.saturating_sub(1));
+                    gray.fill_cr(1 << bit_depth_c.saturating_sub(1));
+                    self.ref_store.insert(entry.dpb_key, gray);
                 }
             }
 
@@ -1087,13 +1102,13 @@ impl H264CodecDecoder {
             let width_samples = sps.pic_width_in_mbs() * 16;
             let height_samples = pic_height_in_mbs * 16;
             let chroma_array_type = sps.chroma_array_type();
-            let pic = Picture::new(
+            let pic = self.allocate_picture(
                 width_samples,
                 height_samples,
                 chroma_array_type,
                 sps.bit_depth_luma_minus8 + 8,
                 sps.bit_depth_chroma_minus8 + 8,
-            );
+            )?;
             let grid = MbGrid::new(sps.pic_width_in_mbs(), pic_height_in_mbs);
 
             // Consume the packet-level pts exactly once per access unit
@@ -1826,28 +1841,35 @@ impl H264CodecDecoder {
             );
         }
 
-        // §8.2.5 / §8.2.1 cross-picture state is committed by the shared
-        // frontend only after reconstruction and deblocking succeeded. The
-        // software backend owns only the reconstructed sample buffers keyed by
-        // the frontend's opaque DPB ids.
+        // Ordinary frame-coded pictures freeze before the shared frontend is
+        // committed. This keeps the handoff transactional: a (theoretical)
+        // arena/header failure cannot advance POC/DPB state. PAFF deliberately
+        // stays mutable because its approved fallback interleaves/copies fields.
+        let output_arena = if first_header.field_pic_flag {
+            None
+        } else {
+            Some(pic.freeze(pts)?)
+        };
+
+        // §8.2.5 / §8.2.1 cross-picture state is committed only after
+        // reconstruction, deblocking and the normal-path arena freeze succeed.
         let commit = self.picture_frontend.commit(prepared);
         let mmco5_triggered = commit.mmco5;
-        if let Some(entry) = commit.current_dpb_entry.as_ref() {
+        let current_ref_key = commit.current_dpb_entry.as_ref().map(|entry| {
             if mmco5_triggered {
                 // Keep the stored Picture's identity aligned with the
                 // frontend's post-MMCO5 DPB descriptor.
                 pic.pic_order_cnt = entry.pic_order_cnt;
                 pic.frame_num = entry.frame_num;
             }
-            self.ref_store.insert(entry.dpb_key, pic.deep_copy());
-        }
+            entry.dpb_key
+        });
         let live_keys: Vec<u32> = self
             .picture_frontend
             .references()
             .iter()
             .map(|e| e.dpb_key)
             .collect();
-        self.ref_store.retain_keys(&live_keys);
 
         // `time_base` was previously stamped onto the VideoFrame for
         // downstream rescaling; the slim VideoFrame shape only carries
@@ -1887,12 +1909,15 @@ impl H264CodecDecoder {
             .map(|e| e.pic_order_cnt)
             .unwrap_or(poc.pic_order_cnt);
 
-        // §C.4.4 — PAFF field pairing. A field picture is not pushed to
-        // the output DPB on its own; it waits for its complementary field
-        // (opposite parity) and the pair is re-interleaved into a single
-        // full-height output frame whose POC is the minimum of the two
-        // field POCs (§8.2.1 eq. 8-1).
+        // §C.4.4 — PAFF remains the explicitly approved copy fallback. A
+        // field can be referenced before its complementary partner arrives, so
+        // keep an independent compact copy in RefPicStore and let the pairing
+        // path materialise/interleave output separately.
         if first_header.field_pic_flag {
+            if let Some(key) = current_ref_key {
+                self.ref_store.insert(key, pic.deep_copy());
+            }
+            self.ref_store.retain_keys(&live_keys);
             self.handle_field_output(
                 pic,
                 first_header.bottom_field_flag,
@@ -1903,16 +1928,16 @@ impl H264CodecDecoder {
             return Ok(());
         }
 
-        let vf = picture_to_video_frame(&pic, pts);
-        let entry = OutputEntry {
-            picture: vf,
-            pic_order_cnt: output_poc,
-            frame_num: first_header.frame_num,
-            needed_for_output: true,
-        };
-        if let Some(bumped) = self.output_dpb.push(entry) {
-            self.ready.push_back(bumped.picture);
+        // Normal frame-coded path: the picture was frozen exactly once above.
+        // The output lease and RefPicStore now retain the same arena allocation;
+        // only H.264 metadata is duplicated/owned separately from the samples.
+        let arena = output_arena.expect("non-field picture was frozen");
+        let output_lease = FrameLease::from_arena_video(Arc::clone(&arena));
+        if let Some(key) = current_ref_key {
+            self.ref_store.insert(key, pic);
         }
+        self.ref_store.retain_keys(&live_keys);
+        self.push_output_lease(output_lease, output_poc, first_header.frame_num);
 
         Ok(())
     }
@@ -1948,15 +1973,7 @@ impl H264CodecDecoder {
                 let frame_poc = prev.field_poc.min(field_poc);
                 let frame_pts = prev.pts.or(pts);
                 let vf = picture_to_video_frame(&frame, frame_pts);
-                let entry = OutputEntry {
-                    picture: vf,
-                    pic_order_cnt: frame_poc,
-                    frame_num,
-                    needed_for_output: true,
-                };
-                if let Some(bumped) = self.output_dpb.push(entry) {
-                    self.ready.push_back(bumped.picture);
-                }
+                self.push_output_frame(vf, frame_poc, frame_num);
                 return;
             }
             // Not complementary — flush the orphaned previous field.
@@ -1977,15 +1994,7 @@ impl H264CodecDecoder {
     /// successor field).
     fn emit_unpaired_field(&mut self, field: PendingField) {
         let vf = picture_to_video_frame(&field.pic, field.pts);
-        let entry = OutputEntry {
-            picture: vf,
-            pic_order_cnt: field.field_poc,
-            frame_num: field.frame_num,
-            needed_for_output: true,
-        };
-        if let Some(bumped) = self.output_dpb.push(entry) {
-            self.ready.push_back(bumped.picture);
-        }
+        self.push_output_frame(vf, field.field_poc, field.frame_num);
     }
 
     /// §C.4.4 — flush any pending unpaired field (e.g. at IDR / EOF). The
@@ -1994,6 +2003,26 @@ impl H264CodecDecoder {
         if let Some(field) = self.pending_field.take() {
             self.emit_unpaired_field(field);
         }
+    }
+
+    fn push_output_lease(&mut self, picture: FrameLease, pic_order_cnt: i32, frame_num: u32) {
+        let entry = OutputEntry {
+            picture,
+            pic_order_cnt,
+            frame_num,
+            needed_for_output: true,
+        };
+        if let Some(bumped) = self.output_dpb.push(entry) {
+            self.ready.push_back(bumped.picture);
+        }
+    }
+
+    fn push_output_frame(&mut self, frame: VideoFrame, pic_order_cnt: i32, frame_num: u32) {
+        self.push_output_lease(
+            FrameLease::from_frame(Frame::Video(frame)),
+            pic_order_cnt,
+            frame_num,
+        );
     }
 
     /// Resize the output DPB capacity from the active SPS's VUI
@@ -2013,7 +2042,7 @@ impl H264CodecDecoder {
             // §C.4 bumping semantics — if the new cap is smaller, the
             // excess is pushed to `ready` in POC order.
             let pending = self.output_dpb.flush();
-            let mut new_dpb = DpbOutput::<VideoFrame>::new(reorder, buffering);
+            let mut new_dpb = DpbOutput::<FrameLease>::new(reorder, buffering);
             // Iterate in the POC-ascending order flush() produced.
             for e in pending {
                 if let Some(bumped) = new_dpb.push(e) {
@@ -2023,12 +2052,76 @@ impl H264CodecDecoder {
             self.output_dpb = new_dpb;
         }
     }
+    /// Keep the reusable sample pool compatible with the active SPS. A new
+    /// pool is cheap because arenas are allocated lazily; frames already
+    /// leased from the previous pool retain their storage independently.
+    fn ensure_picture_pool_sized(&mut self, sps: &Sps) {
+        let required = Picture::required_bytes(
+            sps.pic_width_in_mbs() * 16,
+            sps.frame_height_in_mbs() * 16,
+            sps.chroma_array_type(),
+            sps.bit_depth_luma_minus8 + 8,
+            sps.bit_depth_chroma_minus8 + 8,
+        )
+        .saturating_add(H264_PICTURE_ARENA_PADDING)
+        .max(1);
+        if self.picture_pool.cap_per_arena() != required
+            || self.picture_pool.max_arenas() != H264_PICTURE_POOL_MAX_ARENAS
+        {
+            self.picture_pool = ArenaPool::new(H264_PICTURE_POOL_MAX_ARENAS, required);
+        }
+    }
+
+    /// Convert one already-bumped arena frame to the legacy heap form under
+    /// pool pressure. This is only a compatibility escape hatch for callers
+    /// that feed more than the bounded presentation headroom without draining;
+    /// ordinary producer/consumer playback never reaches it.
+    fn spill_one_ready_arena(&mut self) -> Result<bool> {
+        for lease in self.ready.iter_mut() {
+            if lease.as_arena_video().is_some() {
+                let frame = lease.materialize()?;
+                *lease = FrameLease::from_frame(frame);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn allocate_picture(
+        &mut self,
+        width_samples: u32,
+        height_samples: u32,
+        chroma_array_type: u32,
+        bit_depth_y: u32,
+        bit_depth_c: u32,
+    ) -> Result<Picture> {
+        loop {
+            let pool = Arc::clone(&self.picture_pool);
+            match Picture::new_in(
+                &pool,
+                width_samples,
+                height_samples,
+                chroma_array_type,
+                bit_depth_y,
+                bit_depth_c,
+            ) {
+                Ok(picture) => return Ok(picture),
+                Err(Error::ResourceExhausted(message)) => {
+                    if !self.spill_one_ready_arena()? {
+                        return Err(Error::ResourceExhausted(message));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
 }
 
 /// §8.2.5.2 — mid-grey placeholder picture for a synthetic non-existing
 /// reference frame. Samples are set to `2^(bit_depth - 1)` per plane so
 /// that accidental motion-compensation references produce neutral
 /// output instead of zeroes (which would bias the residual).
+#[cfg(test)]
 fn gray_picture(
     width_samples: u32,
     height_samples: u32,
@@ -2350,6 +2443,29 @@ impl H264CodecDecoder {
         }
         Ok(())
     }
+    fn pop_frame_lease(&mut self) -> Result<FrameLease> {
+        // §C.4 — bumped / already-released pictures come out first in the
+        // order the bumping process produced them.
+        if let Some(lease) = self.ready.pop_front() {
+            return Ok(lease);
+        }
+        // Conservative mid-stream bumping.
+        if let Some(bumped) = self.output_dpb.pop_ready() {
+            return Ok(bumped.picture);
+        }
+        // EOF drains the remaining output DPB exactly once into `ready`.
+        if self.eof {
+            let drained = self.output_dpb.flush();
+            if drained.is_empty() {
+                return Err(Error::Eof);
+            }
+            for entry in drained {
+                self.ready.push_back(entry.picture);
+            }
+            return self.ready.pop_front().ok_or(Error::Eof);
+        }
+        Err(Error::NeedMore)
+    }
 }
 
 impl Decoder for H264CodecDecoder {
@@ -2407,37 +2523,11 @@ impl Decoder for H264CodecDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        // §C.4 — bumped / already-released pictures come out first in
-        // the order the bumping process produced them.
-        if let Some(vf) = self.ready.pop_front() {
-            return Ok(Frame::Video(vf));
-        }
-        // Try a conservative bump on the output DPB. Per §C.4 / the
-        // `pop_ready` semantics, this only yields a picture when the
-        // queue is genuinely over capacity (mid-stream backpressure).
-        if let Some(bumped) = self.output_dpb.pop_ready() {
-            return Ok(Frame::Video(bumped.picture));
-        }
-        // EOF: drain everything remaining in POC-ascending order
-        // (§C.4 "no_output_of_prior_pics_flag == 0" / end-of-stream).
-        // We drain once into `ready` and then hand out one by one,
-        // so subsequent receive_frame calls pull from `ready` above
-        // until exhausted.
-        if self.eof {
-            let drained = self.output_dpb.flush();
-            if drained.is_empty() {
-                return Err(Error::Eof);
-            }
-            for e in drained {
-                self.ready.push_back(e.picture);
-            }
-            // Safe to unwrap: we just confirmed non-empty drain above.
-            if let Some(vf) = self.ready.pop_front() {
-                return Ok(Frame::Video(vf));
-            }
-            return Err(Error::Eof);
-        }
-        Err(Error::NeedMore)
+        self.pop_frame_lease()?.into_frame()
+    }
+
+    fn receive_frame_lease(&mut self) -> Result<FrameLease> {
+        self.pop_frame_lease()
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -2488,6 +2578,12 @@ impl Decoder for H264CodecDecoder {
         // discard in-flight state, not deliver it.
         self.in_progress = None;
         self.pending_field = None;
+        // Detach the next decoding session from arena buffers retained by
+        // application leases obtained before reset(). Those old leases remain
+        // valid through their old Arc<ArenaPool>; the fresh pool can make
+        // progress independently even if every old slot is still retained.
+        let arena_cap = self.picture_pool.cap_per_arena().max(1);
+        self.picture_pool = ArenaPool::new(H264_PICTURE_POOL_MAX_ARENAS, arena_cap);
         // §8.1 — drop the separate-colour-plane sub-decoders wholesale;
         // a post-reset stream re-creates them at its first SCP slice.
         self.scp = None;
@@ -2695,7 +2791,7 @@ mod tests {
 
     fn push_entry(dec: &mut H264CodecDecoder, tag: u8, poc: i32, frame_num: u32) {
         let entry = OutputEntry {
-            picture: vf(tag),
+            picture: FrameLease::from_frame(Frame::Video(vf(tag))),
             pic_order_cnt: poc,
             frame_num,
             needed_for_output: true,
@@ -2703,6 +2799,40 @@ mod tests {
         if let Some(bumped) = dec.output_dpb.push(entry) {
             dec.ready.push_back(bumped.picture);
         }
+    }
+
+    #[test]
+    fn frame_coded_decode_shares_arena_between_reference_store_and_output() {
+        let data = include_bytes!("../tests/fixtures/mbaff_iframe_128x96.h264");
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let packet = Packet::new(0, TimeBase::new(1, 25), data.to_vec()).with_pts(7);
+        dec.send_packet(&packet).expect("send fixture");
+        dec.flush().expect("flush fixture");
+
+        let lease = dec.receive_frame_lease().expect("decoded arena lease");
+        let output = lease
+            .as_arena_video()
+            .expect("ordinary frame-coded H.264 must stay arena-backed");
+        assert_eq!(output.header().presentation_timestamp, Some(7));
+
+        let reference = dec
+            .picture_frontend
+            .references()
+            .first()
+            .expect("IDR retained as a reference");
+        let stored = dec
+            .ref_store
+            .get_by_key(reference.dpb_key)
+            .expect("reference samples retained");
+        let stored_frame = stored
+            .frozen_frame()
+            .expect("reference picture shares frozen arena storage");
+
+        assert_eq!(
+            output.plane(0).expect("output luma").as_ptr(),
+            stored_frame.plane(0).expect("stored luma").as_ptr(),
+            "output and DPB reference must retain the exact same pixel allocation",
+        );
     }
 
     /// §C.4 — with `max_num_reorder_frames == 2`, feeding a decode
@@ -2734,7 +2864,7 @@ mod tests {
     #[test]
     fn reorder_with_small_dpb_matches_conservative_bumping() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.output_dpb = DpbOutput::<VideoFrame>::new(2, 3);
+        dec.output_dpb = DpbOutput::<FrameLease>::new(2, 3);
 
         push_entry(&mut dec, 10, 0, 0); // IDR
         push_entry(&mut dec, 11, 4, 1); // P
@@ -2761,7 +2891,7 @@ mod tests {
         // Cap = 5 ≥ number of pictures → nothing bumps mid-stream,
         // every picture goes through the end-of-stream flush in POC
         // order.
-        dec.output_dpb = DpbOutput::<VideoFrame>::new(5, 5);
+        dec.output_dpb = DpbOutput::<FrameLease>::new(5, 5);
 
         // Same IPBBB decode order as above.
         push_entry(&mut dec, 10, 0, 0); // IDR
@@ -2798,7 +2928,7 @@ mod tests {
     #[test]
     fn flush_at_eof_drains_in_poc_order() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.output_dpb = DpbOutput::<VideoFrame>::new(8, 8);
+        dec.output_dpb = DpbOutput::<FrameLease>::new(8, 8);
 
         // Decode order: [POC 3, POC 1, POC 2] — nothing bumped mid-stream
         // because we stay below capacity.
@@ -2847,7 +2977,7 @@ mod tests {
     #[test]
     fn idr_drains_pending_pictures_in_poc_order() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.output_dpb = DpbOutput::<VideoFrame>::new(4, 4);
+        dec.output_dpb = DpbOutput::<FrameLease>::new(4, 4);
 
         // Sequence 1: POCs 0, 4, 2, 1 — four frames queued, none bumped.
         push_entry(&mut dec, 1, 0, 0);
@@ -2880,7 +3010,8 @@ mod tests {
     #[test]
     fn reset_clears_output_dpb_and_ready() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.output_dpb = DpbOutput::<VideoFrame>::new(2, 2);
+        dec.output_dpb = DpbOutput::<FrameLease>::new(2, 2);
+        let old_pool = Arc::clone(&dec.picture_pool);
         // Fill + overflow so one entry lands in `ready`.
         push_entry(&mut dec, 1, 0, 0);
         push_entry(&mut dec, 2, 1, 1);
@@ -2891,6 +3022,10 @@ mod tests {
         dec.reset().expect("reset");
         assert_eq!(dec.output_dpb.len(), 0);
         assert!(dec.ready.is_empty());
+        assert!(
+            !Arc::ptr_eq(&old_pool, &dec.picture_pool),
+            "reset must detach new decode from pools retained by old leases"
+        );
         assert!(matches!(dec.receive_frame(), Err(Error::NeedMore)));
     }
 
@@ -3033,7 +3168,7 @@ mod tests {
     fn b_pyramid_emits_in_poc_order_at_level_31_720p() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
         // Mirror what the production fix derives for level 3.1 720p.
-        dec.output_dpb = DpbOutput::<VideoFrame>::new(5, 5);
+        dec.output_dpb = DpbOutput::<FrameLease>::new(5, 5);
 
         // Decode order, with (tag = display_index + 1, POC).
         push_entry(&mut dec, 1, 0, 0); // I0   display 0
