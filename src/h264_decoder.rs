@@ -46,18 +46,17 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use oxideav_core::arena::sync::ArenaPool;
+use oxideav_core::arena::sync::{ArenaPool, FrameHeader, VideoFrameBuilder};
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, FrameLease, Packet, Result, TimeBase, VideoFrame,
-    VideoPlane,
+    CodecId, CodecParameters, Error, Frame, FrameLease, Packet, PixelFormat, Result, TimeBase,
 };
 
 use crate::access_unit::AnnexBAccessUnitAssembler;
 use crate::decoder::{Decoder as H264Driver, Event};
 use crate::dpb_output::{DpbOutput, OutputEntry};
 use crate::mb_grid::MbGrid;
-use crate::picture::{Picture, SamplePlane};
+use crate::picture::Picture;
 use crate::picture_frontend::{H264PictureFrontend, PreparedH264Picture};
 use crate::poc::PocResult;
 use crate::ref_list::{self, DpbEntry, PicStructure, RplmOp};
@@ -65,6 +64,9 @@ use crate::ref_store::{RefPicProvider, RefPicStore};
 use crate::slice_header::{RefPicListModificationOp as SliceRplmOp, SliceHeader, SliceType};
 use crate::sps::Sps;
 use crate::{reconstruct, slice_data};
+
+#[cfg(test)]
+use oxideav_core::{VideoFrame, VideoPlane};
 
 /// §7.4.1.2 / §7.4.1.2.4 — state carried forward across slices that
 /// belong to the *same* primary coded picture.
@@ -186,7 +188,7 @@ struct ScpState {
     /// siblings. The three sub-decoders run identical §8.2.1 / §C.4
     /// machinery on identical slice-header fields, so their output
     /// streams pair 1:1 in emission order.
-    queues: [VecDeque<VideoFrame>; 3],
+    queues: [VecDeque<FrameLease>; 3],
 }
 
 impl ScpState {
@@ -271,6 +273,10 @@ pub struct H264CodecDecoder {
     /// software decode. The pool is recreated when the SPS changes geometry or
     /// storage width; old leases keep their former pool alive as needed.
     picture_pool: Arc<ArenaPool>,
+    /// Reusable arena allocations for output that must be assembled from
+    /// multiple decoded pictures (PAFF field pairs and separate colour planes).
+    /// These paths copy during assembly but still expose native ArenaVideo leases.
+    assembly_pool: Arc<ArenaPool>,
 
     // ---- Shared H.264 byte/picture frontend --------------------------
     /// Optional Annex-B access-unit packetiser. AVCC retains its native
@@ -344,6 +350,7 @@ impl H264CodecDecoder {
             pending_time_base: TimeBase::new(1, 1),
             ref_store: RefPicStore::new(),
             picture_pool: ArenaPool::new(H264_PICTURE_POOL_MAX_ARENAS, 1),
+            assembly_pool: ArenaPool::new(H264_PICTURE_POOL_MAX_ARENAS, 1),
             au_assembler: AnnexBAccessUnitAssembler::default(),
             picture_frontend: H264PictureFrontend::new(),
             in_progress: None,
@@ -794,7 +801,7 @@ impl H264CodecDecoder {
             pps,
             sps,
         })?;
-        self.drain_and_merge_scp();
+        self.drain_and_merge_scp()?;
         Ok(())
     }
 
@@ -806,7 +813,7 @@ impl H264CodecDecoder {
             for sub in scp.subs.iter_mut() {
                 sub.handle_event(ev.clone())?;
             }
-            self.drain_and_merge_scp();
+            self.drain_and_merge_scp()?;
         }
         Ok(())
     }
@@ -816,47 +823,48 @@ impl H264CodecDecoder {
     /// frame per completed (S_L, S_Cb, S_Cr) triple (§8.1: "the output
     /// of each of the three decoding processes is assigned to the 3
     /// sample arrays of the current picture").
-    fn drain_and_merge_scp(&mut self) {
-        let Some(scp) = self.scp.as_mut() else {
-            return;
+    fn drain_and_merge_scp(&mut self) -> Result<()> {
+        let mut completed = Vec::new();
+        let dropped = {
+            let Some(scp) = self.scp.as_mut() else {
+                return Ok(());
+            };
+            for (sub, queue) in scp.subs.iter_mut().zip(scp.queues.iter_mut()) {
+                while let Ok(lease) = sub.receive_frame_lease() {
+                    queue.push_back(lease);
+                }
+            }
+            while scp.queues.iter().all(|q| !q.is_empty()) {
+                completed.push((
+                    scp.queues[0].pop_front().expect("checked non-empty"),
+                    scp.queues[1].pop_front().expect("checked non-empty"),
+                    scp.queues[2].pop_front().expect("checked non-empty"),
+                ));
+            }
+
+            // Anti-OOM guard for NON-conforming streams: §7.4.1.2 requires
+            // every access unit to carry all three colour planes, so the
+            // per-plane queues stay shallow on legal input. A malformed
+            // stream feeding only one colour_plane_id would otherwise grow
+            // its queue without bound — drop the oldest unpairable plane
+            // pictures past a generous cap and count them as decode errors.
+            const SCP_QUEUE_CAP: usize = 64;
+            let mut dropped = 0u64;
+            for q in scp.queues.iter_mut() {
+                while q.len() > SCP_QUEUE_CAP {
+                    q.pop_front();
+                    dropped += 1;
+                }
+            }
+            dropped
         };
-        for (sub, queue) in scp.subs.iter_mut().zip(scp.queues.iter_mut()) {
-            while let Ok(Frame::Video(vf)) = sub.receive_frame() {
-                queue.push_back(vf);
-            }
-        }
-        while scp.queues.iter().all(|q| !q.is_empty()) {
-            let y = scp.queues[0].pop_front().expect("checked non-empty");
-            let cb = scp.queues[1].pop_front().expect("checked non-empty");
-            let cr = scp.queues[2].pop_front().expect("checked non-empty");
-            let mut planes = y.planes;
-            // Each sub-decoder emitted a single-plane monochrome frame
-            // of identical geometry (all three planes share the SPS). SCP is
-            // the approved copy/materialisation fallback for this stage.
-            planes.extend(cb.planes);
-            planes.extend(cr.planes);
-            self.ready
-                .push_back(FrameLease::from_frame(Frame::Video(VideoFrame {
-                    pts: y.pts,
-                    planes,
-                })));
-        }
-        // Anti-OOM guard for NON-conforming streams: §7.4.1.2 requires
-        // every access unit to carry all three colour planes, so the
-        // per-plane queues stay shallow on legal input. A malformed
-        // stream feeding only one colour_plane_id would otherwise grow
-        // its queue without bound — drop the oldest unpairable plane
-        // pictures past a generous cap and count them as decode
-        // errors.
-        const SCP_QUEUE_CAP: usize = 64;
-        let mut dropped = 0u64;
-        for q in scp.queues.iter_mut() {
-            while q.len() > SCP_QUEUE_CAP {
-                q.pop_front();
-                dropped += 1;
-            }
-        }
         self.decode_errors += dropped;
+
+        for (y, cb, cr) in completed {
+            let merged = merge_separate_colour_planes(&mut self.assembly_pool, &y, &cb, &cr)?;
+            self.ready.push_back(merged);
+        }
+        Ok(())
     }
 
     /// §7.4.1.2.4 — decide whether `header` opens a new primary coded
@@ -1882,7 +1890,7 @@ impl H264CodecDecoder {
         // unpaired field from the previous sequence can never be paired
         // now, so emit it as a half-height frame before the drain.
         if is_idr || mmco5_triggered {
-            self.flush_pending_field();
+            self.flush_pending_field()?;
             for drained in self.output_dpb.flush() {
                 self.ready.push_back(drained.picture);
             }
@@ -1924,7 +1932,7 @@ impl H264CodecDecoder {
                 first_header.frame_num,
                 output_poc,
                 pts,
-            );
+            )?;
             return Ok(());
         }
 
@@ -1954,7 +1962,7 @@ impl H264CodecDecoder {
         frame_num: u32,
         field_poc: i32,
         pts: Option<i64>,
-    ) {
+    ) -> Result<()> {
         if let Some(prev) = self.pending_field.take() {
             // Complete the pair only when the two fields are genuinely
             // complementary (opposite parity, same frame_num). A second
@@ -1967,17 +1975,17 @@ impl H264CodecDecoder {
                 } else {
                     (&prev.pic, &pic)
                 };
-                let frame = interleave_fields(top, bottom);
+                let mut frame = interleave_fields_in_pool(&mut self.assembly_pool, top, bottom)?;
                 // §8.2.1 eq. 8-1 — PicOrderCnt(frame) =
                 // Min(TopFieldOrderCnt, BottomFieldOrderCnt).
                 let frame_poc = prev.field_poc.min(field_poc);
                 let frame_pts = prev.pts.or(pts);
-                let vf = picture_to_video_frame(&frame, frame_pts);
-                self.push_output_frame(vf, frame_poc, frame_num);
-                return;
+                let arena = frame.freeze(frame_pts)?;
+                self.push_output_lease(FrameLease::from_arena_video(arena), frame_poc, frame_num);
+                return Ok(());
             }
             // Not complementary — flush the orphaned previous field.
-            self.emit_unpaired_field(prev);
+            self.emit_unpaired_field(prev)?;
         }
         self.pending_field = Some(PendingField {
             pic,
@@ -1986,23 +1994,29 @@ impl H264CodecDecoder {
             field_poc,
             pts,
         });
+        Ok(())
     }
 
     /// Emit a leftover (unpaired) field as a standalone half-height frame,
-    /// pushed through the §C.4 output DPB in POC order. Used when a field
-    /// cannot be paired (sequence boundary, or a non-complementary
-    /// successor field).
-    fn emit_unpaired_field(&mut self, field: PendingField) {
-        let vf = picture_to_video_frame(&field.pic, field.pts);
-        self.push_output_frame(vf, field.field_poc, field.frame_num);
+    /// pushed through the §C.4 output DPB in POC order. The original field
+    /// allocation is frozen directly; no legacy VideoFrame is materialised.
+    fn emit_unpaired_field(&mut self, mut field: PendingField) -> Result<()> {
+        let arena = field.pic.freeze(field.pts)?;
+        self.push_output_lease(
+            FrameLease::from_arena_video(arena),
+            field.field_poc,
+            field.frame_num,
+        );
+        Ok(())
     }
 
     /// §C.4.4 — flush any pending unpaired field (e.g. at IDR / EOF). The
-    /// field is emitted as a standalone half-height frame.
-    fn flush_pending_field(&mut self) {
+    /// field is emitted as a standalone half-height arena frame.
+    fn flush_pending_field(&mut self) -> Result<()> {
         if let Some(field) = self.pending_field.take() {
-            self.emit_unpaired_field(field);
+            self.emit_unpaired_field(field)?;
         }
+        Ok(())
     }
 
     fn push_output_lease(&mut self, picture: FrameLease, pic_order_cnt: i32, frame_num: u32) {
@@ -2015,14 +2029,6 @@ impl H264CodecDecoder {
         if let Some(bumped) = self.output_dpb.push(entry) {
             self.ready.push_back(bumped.picture);
         }
-    }
-
-    fn push_output_frame(&mut self, frame: VideoFrame, pic_order_cnt: i32, frame_num: u32) {
-        self.push_output_lease(
-            FrameLease::from_frame(Frame::Video(frame)),
-            pic_order_cnt,
-            frame_num,
-        );
     }
 
     /// Resize the output DPB capacity from the active SPS's VUI
@@ -2072,21 +2078,6 @@ impl H264CodecDecoder {
         }
     }
 
-    /// Convert one already-bumped arena frame to the legacy heap form under
-    /// pool pressure. This is only a compatibility escape hatch for callers
-    /// that feed more than the bounded presentation headroom without draining;
-    /// ordinary producer/consumer playback never reaches it.
-    fn spill_one_ready_arena(&mut self) -> Result<bool> {
-        for lease in self.ready.iter_mut() {
-            if lease.as_arena_video().is_some() {
-                let frame = lease.materialize()?;
-                *lease = FrameLease::from_frame(frame);
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     fn allocate_picture(
         &mut self,
         width_samples: u32,
@@ -2095,25 +2086,14 @@ impl H264CodecDecoder {
         bit_depth_y: u32,
         bit_depth_c: u32,
     ) -> Result<Picture> {
-        loop {
-            let pool = Arc::clone(&self.picture_pool);
-            match Picture::new_in(
-                &pool,
-                width_samples,
-                height_samples,
-                chroma_array_type,
-                bit_depth_y,
-                bit_depth_c,
-            ) {
-                Ok(picture) => return Ok(picture),
-                Err(Error::ResourceExhausted(message)) => {
-                    if !self.spill_one_ready_arena()? {
-                        return Err(Error::ResourceExhausted(message));
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        Picture::new_in(
+            &self.picture_pool,
+            width_samples,
+            height_samples,
+            chroma_array_type,
+            bit_depth_y,
+            bit_depth_c,
+        )
     }
 }
 
@@ -2548,14 +2528,14 @@ impl Decoder for H264CodecDecoder {
         // §C.4.4 — a trailing unpaired PAFF field at EOF can never gain a
         // complementary partner; emit it as a standalone half-height
         // frame so it is not silently dropped.
-        self.flush_pending_field();
+        self.flush_pending_field()?;
         // §8.1 — flush the three separate-colour-plane sub-decoders and
         // merge their drained plane pictures into three-plane frames.
         if let Some(scp) = self.scp.as_mut() {
             for sub in scp.subs.iter_mut() {
                 sub.flush()?;
             }
-            self.drain_and_merge_scp();
+            self.drain_and_merge_scp()?;
         }
         self.eof = true;
         Ok(())
@@ -2584,6 +2564,8 @@ impl Decoder for H264CodecDecoder {
         // progress independently even if every old slot is still retained.
         let arena_cap = self.picture_pool.cap_per_arena().max(1);
         self.picture_pool = ArenaPool::new(H264_PICTURE_POOL_MAX_ARENAS, arena_cap);
+        let assembly_cap = self.assembly_pool.cap_per_arena().max(1);
+        self.assembly_pool = ArenaPool::new(H264_PICTURE_POOL_MAX_ARENAS, assembly_cap);
         // §8.1 — drop the separate-colour-plane sub-decoders wholesale;
         // a post-reset stream re-creates them at its first SCP slice.
         self.scp = None;
@@ -2631,6 +2613,111 @@ fn snapshot_grid_into_picture(pic: &mut Picture, grid: &MbGrid) {
     }
 }
 
+fn ensure_assembly_pool_sized(pool: &mut Arc<ArenaPool>, required: usize) {
+    if pool.cap_per_arena() != required || pool.max_arenas() != H264_PICTURE_POOL_MAX_ARENAS {
+        *pool = ArenaPool::new(H264_PICTURE_POOL_MAX_ARENAS, required);
+    }
+}
+
+fn merge_separate_colour_planes(
+    pool: &mut Arc<ArenaPool>,
+    y: &FrameLease,
+    cb: &FrameLease,
+    cr: &FrameLease,
+) -> Result<FrameLease> {
+    let y = y.as_arena_video().ok_or_else(|| {
+        Error::other("h264: separate-colour-plane sub-decoder emitted non-arena luma")
+    })?;
+    let cb = cb.as_arena_video().ok_or_else(|| {
+        Error::other("h264: separate-colour-plane sub-decoder emitted non-arena Cb")
+    })?;
+    let cr = cr.as_arena_video().ok_or_else(|| {
+        Error::other("h264: separate-colour-plane sub-decoder emitted non-arena Cr")
+    })?;
+
+    let yh = y.header();
+    let cbh = cb.header();
+    let crh = cr.header();
+    if yh.width != cbh.width
+        || yh.width != crh.width
+        || yh.height != cbh.height
+        || yh.height != crh.height
+        || yh.pixel_format != cbh.pixel_format
+        || yh.pixel_format != crh.pixel_format
+    {
+        return Err(Error::invalid(
+            "h264: separate colour planes have mismatched geometry or sample format",
+        ));
+    }
+    let (pixel_format, nominal_bits) = match yh.pixel_format {
+        PixelFormat::Gray8 => (PixelFormat::Yuv444P, 8),
+        PixelFormat::Gray10Le => (PixelFormat::Yuv444P10Le, 10),
+        PixelFormat::Gray12Le => (PixelFormat::Yuv444P12Le, 12),
+        PixelFormat::Gray16Le => (PixelFormat::Yuv444P16Le, 16),
+        other => {
+            return Err(Error::unsupported(format!(
+                "h264: unsupported separate-colour-plane arena format {other:?}"
+            )));
+        }
+    };
+
+    let y_plane = y
+        .plane(0)
+        .ok_or_else(|| Error::invalid("h264: missing SCP luma plane"))?;
+    let cb_plane = cb
+        .plane(0)
+        .ok_or_else(|| Error::invalid("h264: missing SCP Cb plane"))?;
+    let cr_plane = cr
+        .plane(0)
+        .ok_or_else(|| Error::invalid("h264: missing SCP Cr plane"))?;
+    let strides = [
+        y.plane_stride(0)
+            .ok_or_else(|| Error::invalid("h264: missing SCP luma stride"))?,
+        cb.plane_stride(0)
+            .ok_or_else(|| Error::invalid("h264: missing SCP Cb stride"))?,
+        cr.plane_stride(0)
+            .ok_or_else(|| Error::invalid("h264: missing SCP Cr stride"))?,
+    ];
+    let lengths = [y_plane.len(), cb_plane.len(), cr_plane.len()];
+    let required = lengths
+        .iter()
+        .try_fold(0usize, |sum, len| sum.checked_add(*len))
+        .and_then(|sum| sum.checked_add(H264_PICTURE_ARENA_PADDING))
+        .ok_or_else(|| Error::resource_exhausted("h264: SCP output arena size overflow"))?
+        .max(1);
+    ensure_assembly_pool_sized(pool, required);
+    let arena = pool.lease()?;
+    let mut builder = VideoFrameBuilder::<u8>::new(arena, &lengths, &strides)?;
+    builder
+        .plane_mut(0)
+        .expect("three output planes")
+        .copy_from_slice(y_plane);
+    builder
+        .plane_mut(1)
+        .expect("three output planes")
+        .copy_from_slice(cb_plane);
+    builder
+        .plane_mut(2)
+        .expect("three output planes")
+        .copy_from_slice(cr_plane);
+
+    let mut header = FrameHeader::new(yh.width, yh.height, pixel_format, yh.presentation_timestamp);
+    let precision = [
+        yh.significant_bits().and_then(|bits| bits.first()).copied(),
+        cbh.significant_bits()
+            .and_then(|bits| bits.first())
+            .copied(),
+        crh.significant_bits()
+            .and_then(|bits| bits.first())
+            .copied(),
+    ];
+    if precision.iter().any(Option::is_some) {
+        let bits = precision.map(|bits| bits.unwrap_or(nominal_bits));
+        header = header.with_significant_bits(&bits)?;
+    }
+    Ok(FrameLease::from_arena_video(builder.freeze(header)?))
+}
+
 /// §C.4.4 / §8.4.2 — re-interleave a complementary pair of half-height
 /// field pictures into a single full-height frame.
 ///
@@ -2641,16 +2728,46 @@ fn snapshot_grid_into_picture(pic: &mut Picture, grid: &MbGrid) {
 /// occupying alternate output lines. The frame inherits the fields' bit
 /// depth, chroma format and width.
 fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
+    let required = Picture::required_bytes(
+        top.width_in_samples,
+        top.height_in_samples.saturating_mul(2),
+        top.chroma_array_type,
+        top.bit_depth_luma,
+        top.bit_depth_chroma,
+    )
+    .saturating_add(H264_PICTURE_ARENA_PADDING)
+    .max(1);
+    let mut pool = ArenaPool::new(1, required);
+    interleave_fields_in_pool(&mut pool, top, bottom)
+        .expect("standalone PAFF interleave allocation")
+}
+
+fn interleave_fields_in_pool(
+    pool: &mut Arc<ArenaPool>,
+    top: &Picture,
+    bottom: &Picture,
+) -> Result<Picture> {
     let w = top.width_in_samples;
     let field_h = top.height_in_samples;
     let frame_h = field_h * 2;
-    let mut frame = Picture::new(
+    let required = Picture::required_bytes(
         w,
         frame_h,
         top.chroma_array_type,
         top.bit_depth_luma,
         top.bit_depth_chroma,
-    );
+    )
+    .saturating_add(H264_PICTURE_ARENA_PADDING)
+    .max(1);
+    ensure_assembly_pool_sized(pool, required);
+    let mut frame = Picture::new_in(
+        pool,
+        w,
+        frame_h,
+        top.chroma_array_type,
+        top.bit_depth_luma,
+        top.bit_depth_chroma,
+    )?;
 
     // Luma: approved PAFF fallback copy. Widen one source row into scratch,
     // then compact it directly into the parity-selected destination row.
@@ -2680,72 +2797,7 @@ fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
 
     frame.pic_order_cnt = top.pic_order_cnt.min(bottom.pic_order_cnt);
     frame.frame_num = top.frame_num;
-    frame
-}
-
-/// Convert a reconstructed [`Picture`] to a [`VideoFrame`].
-///
-/// Samples are emitted at the picture's native bit depth:
-/// * 8-bit luma/chroma → one byte per sample, clamped to `0..=255`.
-///   Stride is `width_in_samples` for luma and `chroma_width()` for
-///   each chroma plane (matches `PixelFormat::Yuv420P` / `Yuv422P` /
-///   `Yuv444P` layout).
-/// * 9..=14-bit luma/chroma (High10 / High 4:2:2 / High 4:4:4
-///   Predictive) → two bytes per sample, little-endian, clamped to
-///   `0..=(1 << bit_depth) - 1`. Stride is `width * 2` for luma and
-///   `chroma_width * 2` for chroma. This matches the `Yuv420P10Le` /
-///   `Yuv422P10Le` / `Yuv444P10Le` (and 12-bit) layouts documented on
-///   `oxideav_core::PixelFormat`: little-endian u16 packed two bytes
-///   per sample.
-///
-/// The slim `VideoFrame` shape only carries `pts` + `planes`; the pixel
-/// format / resolution / time_base live on the stream's
-/// [`CodecParameters`] (set by the decoder from the SPS).
-fn picture_to_video_frame(pic: &Picture, pts: Option<i64>) -> VideoFrame {
-    let w = pic.width_in_samples as usize;
-    let cw = pic.chroma_width() as usize;
-    let wide_container = pic.bit_depth_luma.max(pic.bit_depth_chroma) > 8;
-
-    // This compatibility path copies already-final compact sample storage; it
-    // performs no i32 conversion. The normal progressive path will disappear
-    // in stage 3 when it returns the frozen arena lease directly.
-    let plane_bytes = |src: SamplePlane<'_>| -> Vec<u8> {
-        match src {
-            SamplePlane::U8(src) => src.to_vec(),
-            SamplePlane::U16(src) => {
-                let mut out = Vec::with_capacity(src.len() * 2);
-                for &stored_le in src {
-                    // `stored_le` is already endian-adjusted so its native memory
-                    // bytes are the public little-endian pixel representation.
-                    out.extend_from_slice(&stored_le.to_ne_bytes());
-                }
-                out
-            }
-        }
-    };
-
-    let bytes_per_sample = if wide_container { 2 } else { 1 };
-    let mut planes = vec![VideoPlane {
-        stride: w * bytes_per_sample,
-        data: plane_bytes(pic.luma_plane()),
-    }];
-    if pic.chroma_array_type != 0 {
-        let chroma_stride = cw * bytes_per_sample;
-        planes.push(VideoPlane {
-            stride: chroma_stride,
-            data: plane_bytes(pic.cb_plane()),
-        });
-        planes.push(VideoPlane {
-            stride: chroma_stride,
-            data: plane_bytes(pic.cr_plane()),
-        });
-    }
-
-    let mut frame = VideoFrame { pts, planes };
-    if let Some(bits) = pic.significant_bits_metadata() {
-        frame.set_significant_bits(bits);
-    }
-    frame
+    Ok(frame)
 }
 
 #[cfg(test)]
@@ -3939,32 +3991,36 @@ mod tests {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
         // Top field then bottom field of the same frame_num.
         let top = field_pic(16, 4, 30, 128, 8, 3);
-        dec.handle_field_output(top, false, 3, 8, Some(99));
+        dec.handle_field_output(top, false, 3, 8, Some(99))
+            .expect("queue top field");
         // The first field alone produces no output (held pending).
         assert!(dec.ready.is_empty());
         assert!(dec.pending_field.is_some());
 
         let bottom = field_pic(16, 4, 40, 128, 10, 3);
-        dec.handle_field_output(bottom, true, 3, 10, None);
+        dec.handle_field_output(bottom, true, 3, 10, None)
+            .expect("complete field pair");
         // Pair completed → pending cleared, one frame queued (possibly
         // still inside the output DPB until bumped). Force a drain.
         assert!(dec.pending_field.is_none());
         dec.eof = true;
-        let f = dec.receive_frame().expect("paired frame must drain");
-        let vf = match f {
-            Frame::Video(v) => v,
-            other => panic!("expected video, got {other:?}"),
-        };
+        let lease = dec
+            .receive_frame_lease()
+            .expect("paired frame must drain as a lease");
+        let frame = lease
+            .as_arena_video()
+            .expect("paired PAFF output must remain arena-backed");
         // Full-height (8 rows) 16-wide luma; pts inherited from the
         // first (top) field.
-        assert_eq!(vf.pts, Some(99));
-        assert_eq!(vf.planes[0].stride, 16);
-        assert_eq!(vf.planes[0].data.len(), 16 * 8);
+        assert_eq!(frame.header().presentation_timestamp, Some(99));
+        assert_eq!(frame.plane_stride(0), Some(16));
+        let luma = frame.plane(0).expect("luma plane");
+        assert_eq!(luma.len(), 16 * 8);
         // Even rows = top field (30), odd rows = bottom (40).
         for r in 0..8 {
             let expect = if r % 2 == 0 { 30u8 } else { 40u8 };
             for c in 0..16 {
-                assert_eq!(vf.planes[0].data[r * 16 + c], expect);
+                assert_eq!(luma[r * 16 + c], expect);
             }
         }
     }
@@ -3975,21 +4031,84 @@ mod tests {
         // Two consecutive TOP fields (same parity) → not a pair. The
         // first must be emitted on its own, the second held pending.
         let top1 = field_pic(16, 4, 30, 128, 8, 3);
-        dec.handle_field_output(top1, false, 3, 8, None);
+        dec.handle_field_output(top1, false, 3, 8, None)
+            .expect("queue first top field");
         let top2 = field_pic(16, 4, 50, 128, 12, 4);
-        dec.handle_field_output(top2, false, 4, 12, None);
+        dec.handle_field_output(top2, false, 4, 12, None)
+            .expect("flush orphaned field");
         // First top field orphaned → one half-height frame queued; the
         // second top field is now pending.
         assert!(dec.pending_field.is_some());
         dec.eof = true;
-        let f = dec.receive_frame().expect("orphan field drains");
-        let vf = match f {
-            Frame::Video(v) => v,
-            other => panic!("expected video, got {other:?}"),
-        };
+        let lease = dec
+            .receive_frame_lease()
+            .expect("orphan field drains as a lease");
+        let frame = lease
+            .as_arena_video()
+            .expect("unpaired PAFF output must remain arena-backed");
         // Half-height (4 rows) — an unpaired field is emitted as-is.
-        assert_eq!(vf.planes[0].data.len(), 16 * 4);
-        assert_eq!(vf.planes[0].data[0], 30);
+        let luma = frame.plane(0).expect("luma plane");
+        assert_eq!(luma.len(), 16 * 4);
+        assert_eq!(luma[0], 30);
+    }
+
+    fn gray_arena_4x2(fill: u8, pts: Option<i64>) -> FrameLease {
+        let pool = ArenaPool::new(1, 8 + H264_PICTURE_ARENA_PADDING);
+        let arena = pool.lease().expect("gray arena");
+        let mut builder = VideoFrameBuilder::<u8>::new(arena, &[8], &[4]).expect("gray builder");
+        builder.plane_mut(0).expect("gray plane").fill(fill);
+        let frame = builder
+            .freeze(FrameHeader::new(4, 2, PixelFormat::Gray8, pts))
+            .expect("gray frame");
+        FrameLease::from_arena_video(frame)
+    }
+
+    #[test]
+    fn separate_colour_plane_merge_outputs_arena_video() {
+        let y = gray_arena_4x2(10, Some(77));
+        let cb = gray_arena_4x2(20, None);
+        let cr = gray_arena_4x2(30, None);
+        let mut pool = ArenaPool::new(H264_PICTURE_POOL_MAX_ARENAS, 1);
+        let lease = merge_separate_colour_planes(&mut pool, &y, &cb, &cr)
+            .expect("merge separate colour planes");
+        let frame = lease
+            .as_arena_video()
+            .expect("SCP output must remain arena-backed");
+        assert_eq!(frame.header().pixel_format, PixelFormat::Yuv444P);
+        assert_eq!(frame.header().presentation_timestamp, Some(77));
+        assert_eq!(frame.plane_count(), 3);
+        assert!(frame.plane(0).unwrap().iter().all(|&value| value == 10));
+        assert!(frame.plane(1).unwrap().iter().all(|&value| value == 20));
+        assert!(frame.plane(2).unwrap().iter().all(|&value| value == 30));
+    }
+
+    #[test]
+    fn picture_pool_exhaustion_does_not_materialise_ready_arena() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let required =
+            Picture::required_bytes(16, 16, 1, 8, 8).saturating_add(H264_PICTURE_ARENA_PADDING);
+        dec.picture_pool = ArenaPool::new(1, required);
+
+        let mut first = dec
+            .allocate_picture(16, 16, 1, 8, 8)
+            .expect("first pooled picture");
+        let retained = first.freeze(None).expect("freeze first picture");
+        dec.ready
+            .push_back(FrameLease::from_arena_video(Arc::clone(&retained)));
+
+        let err = match dec.allocate_picture(16, 16, 1, 8, 8) {
+            Ok(_) => panic!("one-slot pool should be exhausted"),
+            Err(error) => error,
+        };
+        assert!(matches!(err, Error::ResourceExhausted(_)));
+        let ready = dec.ready.front().expect("retained ready frame");
+        let ready_arena = ready
+            .as_arena_video()
+            .expect("pool pressure must not convert ready output to Owned");
+        assert_eq!(
+            ready_arena.plane(0).unwrap().as_ptr(),
+            retained.plane(0).unwrap().as_ptr(),
+        );
     }
 
     /// Round 430 (2026-07-25 scheduled-fuzz OOM triage) — §8.2.5.2
