@@ -14,7 +14,9 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use oxideav_core::arena::sync::{ArenaPool, Frame as ArenaFrame, FrameHeader, VideoFrameBuilder};
+use oxideav_core::arena::sync::{
+    Arena, ArenaPool, Frame as ArenaFrame, FrameHeader, VideoFrameBuilder,
+};
 use oxideav_core::{PixelFormat, Result};
 
 /// §8.4.1.2.1 Table 8-7 — `PicCodingStruct( X )` of a decoded picture.
@@ -203,9 +205,55 @@ impl Picture {
         .expect("standalone H.264 picture allocation")
     }
 
-    /// Allocate reconstruction planes from a reusable arena pool.
+    /// Allocate reconstruction planes from a reusable arena pool without
+    /// blocking. Callers that are part of a producer/consumer pipeline and
+    /// want pool pressure to become back-pressure should use
+    /// [`Self::new_in_wait`].
     pub fn new_in(
         pool: &Arc<ArenaPool>,
+        width_in_samples: u32,
+        height_in_samples: u32,
+        chroma_array_type: u32,
+        bit_depth_luma: u32,
+        bit_depth_chroma: u32,
+    ) -> Result<Self> {
+        Self::new_in_arena(
+            pool.lease()?,
+            width_in_samples,
+            height_in_samples,
+            chroma_array_type,
+            bit_depth_luma,
+            bit_depth_chroma,
+        )
+    }
+
+    /// Allocate reconstruction planes from a reusable arena pool, waiting for
+    /// an existing retained frame to release a slot when the pool is full.
+    ///
+    /// The software streaming decoder uses this path so temporary downstream
+    /// back-pressure does not turn into a codec error and corrupt its picture
+    /// state. The wait is fulfilled by [`ArenaPool`] when any arena from this
+    /// pool is returned.
+    pub fn new_in_wait(
+        pool: &Arc<ArenaPool>,
+        width_in_samples: u32,
+        height_in_samples: u32,
+        chroma_array_type: u32,
+        bit_depth_luma: u32,
+        bit_depth_chroma: u32,
+    ) -> Result<Self> {
+        Self::new_in_arena(
+            pool.lease_wait()?,
+            width_in_samples,
+            height_in_samples,
+            chroma_array_type,
+            bit_depth_luma,
+            bit_depth_chroma,
+        )
+    }
+
+    fn new_in_arena(
+        arena: Arena,
         width_in_samples: u32,
         height_in_samples: u32,
         chroma_array_type: u32,
@@ -227,7 +275,6 @@ impl Picture {
             strides.push(cw as usize * bytes_per_sample);
             strides.push(cw as usize * bytes_per_sample);
         }
-        let arena = pool.lease()?;
         let storage = if wide {
             PictureStorage::Writable16(VideoFrameBuilder::<u16>::new(
                 arena,

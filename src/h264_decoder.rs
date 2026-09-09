@@ -2086,7 +2086,7 @@ impl H264CodecDecoder {
         bit_depth_y: u32,
         bit_depth_c: u32,
     ) -> Result<Picture> {
-        Picture::new_in(
+        Picture::new_in_wait(
             &self.picture_pool,
             width_samples,
             height_samples,
@@ -2686,7 +2686,7 @@ fn merge_separate_colour_planes(
         .ok_or_else(|| Error::resource_exhausted("h264: SCP output arena size overflow"))?
         .max(1);
     ensure_assembly_pool_sized(pool, required);
-    let arena = pool.lease()?;
+    let arena = pool.lease_wait()?;
     let mut builder = VideoFrameBuilder::<u8>::new(arena, &lengths, &strides)?;
     builder
         .plane_mut(0)
@@ -2760,7 +2760,7 @@ fn interleave_fields_in_pool(
     .saturating_add(H264_PICTURE_ARENA_PADDING)
     .max(1);
     ensure_assembly_pool_sized(pool, required);
-    let mut frame = Picture::new_in(
+    let mut frame = Picture::new_in_wait(
         pool,
         w,
         frame_h,
@@ -4083,32 +4083,40 @@ mod tests {
     }
 
     #[test]
-    fn picture_pool_exhaustion_does_not_materialise_ready_arena() {
+    fn picture_pool_pressure_blocks_until_retained_arena_returns() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
         let required =
             Picture::required_bytes(16, 16, 1, 8, 8).saturating_add(H264_PICTURE_ARENA_PADDING);
-        dec.picture_pool = ArenaPool::new(1, required);
+        let pool = ArenaPool::new(1, required);
+        dec.picture_pool = Arc::clone(&pool);
 
-        let mut first = dec
-            .allocate_picture(16, 16, 1, 8, 8)
-            .expect("first pooled picture");
-        let retained = first.freeze(None).expect("freeze first picture");
-        dec.ready
-            .push_back(FrameLease::from_arena_video(Arc::clone(&retained)));
+        // Model a downstream consumer retaining the only pooled picture.
+        let mut first = Picture::new_in(&pool, 16, 16, 1, 8, 8).expect("first pooled picture");
+        let retained = FrameLease::from_arena_video(first.freeze(None).expect("freeze first"));
+        drop(first);
 
-        let err = match dec.allocate_picture(16, 16, 1, 8, 8) {
-            Ok(_) => panic!("one-slot pool should be exhausted"),
-            Err(error) => error,
-        };
-        assert!(matches!(err, Error::ResourceExhausted(_)));
-        let ready = dec.ready.front().expect("retained ready frame");
-        let ready_arena = ready
-            .as_arena_video()
-            .expect("pool pressure must not convert ready output to Owned");
-        assert_eq!(
-            ready_arena.plane(0).unwrap().as_ptr(),
-            retained.plane(0).unwrap().as_ptr(),
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = dec.allocate_picture(16, 16, 1, 8, 8).is_ok();
+            tx.send(result).expect("report allocation result");
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "decoder allocation must wait while every arena is retained"
         );
+
+        drop(retained);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("allocation should resume after arena release"),
+            "decoder allocation should succeed after retained arena returns"
+        );
+        worker.join().expect("allocation worker");
     }
 
     /// Round 430 (2026-07-25 scheduled-fuzz OOM triage) — §8.2.5.2
