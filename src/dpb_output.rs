@@ -152,6 +152,10 @@ impl<P> DpbOutput<P> {
         self.entries.is_empty()
     }
 
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &OutputEntry<P>> {
+        self.entries.iter()
+    }
+
     /// §C.4 bumping primitive — remove and return the lowest-POC entry
     /// (ties broken by smaller `frame_num`). Returns `None` on empty.
     fn bump_lowest(&mut self) -> Option<OutputEntry<P>> {

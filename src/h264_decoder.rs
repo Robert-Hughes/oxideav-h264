@@ -43,13 +43,14 @@
 //! this decoder (via [`crate::register`]) stops the "codec not found"
 //! error on the first h264 packet.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use oxideav_core::arena::sync::{ArenaPool, FrameHeader, VideoFrameBuilder};
+use oxideav_core::arena::sync::{Arena, ArenaIdentity, ArenaPool, FrameHeader, VideoFrameBuilder};
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, FrameLease, Packet, PixelFormat, Result, TimeBase,
+    CancellationToken, CodecId, CodecParameters, Error, Frame, FrameLease, Packet, PixelFormat,
+    Result, TimeBase,
 };
 
 use crate::access_unit::AnnexBAccessUnitAssembler;
@@ -192,10 +193,11 @@ struct ScpState {
 }
 
 impl ScpState {
-    fn new(codec_id: &CodecId) -> Self {
+    fn new(codec_id: &CodecId, cancellation: Option<&CancellationToken>) -> Self {
         let mk = || {
             let mut d = H264CodecDecoder::new(codec_id.clone());
             d.scp_plane_mode = true;
+            d.cancellation = cancellation.cloned();
             Box::new(d)
         };
         Self {
@@ -277,6 +279,13 @@ pub struct H264CodecDecoder {
     /// multiple decoded pictures (PAFF field pairs and separate colour planes).
     /// These paths copy during assembly but still expose native ArenaVideo leases.
     assembly_pool: Arc<ArenaPool>,
+    /// Cooperative cancellation supplied by the pipeline. Blocking arena waits
+    /// are only used when this token is available.
+    cancellation: Option<CancellationToken>,
+    /// Arena allocations owned by a containing decoder but retained outside this
+    /// sub-decoder's own fields (currently separate-colour-plane queues). They
+    /// count as decoder-internal for self-deadlock detection.
+    extra_internal_arenas: HashSet<ArenaIdentity>,
 
     // ---- Shared H.264 byte/picture frontend --------------------------
     /// Optional Annex-B access-unit packetiser. AVCC retains its native
@@ -351,6 +360,8 @@ impl H264CodecDecoder {
             ref_store: RefPicStore::new(),
             picture_pool: ArenaPool::new(H264_PICTURE_POOL_MAX_ARENAS, 1),
             assembly_pool: ArenaPool::new(H264_PICTURE_POOL_MAX_ARENAS, 1),
+            cancellation: None,
+            extra_internal_arenas: HashSet::new(),
             au_assembler: AnnexBAccessUnitAssembler::default(),
             picture_frontend: H264PictureFrontend::new(),
             in_progress: None,
@@ -781,9 +792,11 @@ impl H264CodecDecoder {
                 header.colour_plane_id
             )));
         }
+        let codec_id = self.codec_id.clone();
+        let cancellation = self.cancellation.clone();
         let scp = self
             .scp
-            .get_or_insert_with(|| Box::new(ScpState::new(&self.codec_id)));
+            .get_or_insert_with(|| Box::new(ScpState::new(&codec_id, cancellation.as_ref())));
         // The packet pts belongs to the access unit; the plane-0
         // (luma) sub-decoder stamps it and the merged frame reuses it.
         if plane == 0 {
@@ -792,6 +805,7 @@ impl H264CodecDecoder {
             }
             scp.subs[0].pending_time_base = self.pending_time_base;
         }
+        scp.subs[plane].extra_internal_arenas = queue_arena_identities(&scp.queues[plane]);
         scp.subs[plane].handle_event(Event::Slice {
             nal_unit_type,
             nal_ref_idc,
@@ -810,8 +824,10 @@ impl H264CodecDecoder {
     /// separate-colour-plane sub-decoders, when they exist.
     fn forward_event_to_scp_subs(&mut self, ev: &Event) -> Result<()> {
         if let Some(scp) = self.scp.as_mut() {
-            for sub in scp.subs.iter_mut() {
-                sub.handle_event(ev.clone())?;
+            for index in 0..scp.subs.len() {
+                let internal = queue_arena_identities(&scp.queues[index]);
+                scp.subs[index].extra_internal_arenas = internal;
+                scp.subs[index].handle_event(ev.clone())?;
             }
             self.drain_and_merge_scp()?;
         }
@@ -829,10 +845,12 @@ impl H264CodecDecoder {
             let Some(scp) = self.scp.as_mut() else {
                 return Ok(());
             };
-            for (sub, queue) in scp.subs.iter_mut().zip(scp.queues.iter_mut()) {
-                while let Ok(lease) = sub.receive_frame_lease() {
-                    queue.push_back(lease);
+            for index in 0..scp.subs.len() {
+                scp.subs[index].extra_internal_arenas = queue_arena_identities(&scp.queues[index]);
+                while let Ok(lease) = scp.subs[index].receive_frame_lease() {
+                    scp.queues[index].push_back(lease);
                 }
+                scp.subs[index].extra_internal_arenas = queue_arena_identities(&scp.queues[index]);
             }
             while scp.queues.iter().all(|q| !q.is_empty()) {
                 completed.push((
@@ -860,8 +878,17 @@ impl H264CodecDecoder {
         };
         self.decode_errors += dropped;
 
+        let cancellation = self.cancellation.clone();
         for (y, cb, cr) in completed {
-            let merged = merge_separate_colour_planes(&mut self.assembly_pool, &y, &cb, &cr)?;
+            let internal = self.internal_arena_identities(&self.assembly_pool);
+            let merged = merge_separate_colour_planes(
+                &mut self.assembly_pool,
+                &y,
+                &cb,
+                &cr,
+                cancellation.as_ref(),
+                &internal,
+            )?;
             self.ready.push_back(merged);
         }
         Ok(())
@@ -1975,7 +2002,15 @@ impl H264CodecDecoder {
                 } else {
                     (&prev.pic, &pic)
                 };
-                let mut frame = interleave_fields_in_pool(&mut self.assembly_pool, top, bottom)?;
+                let internal = self.internal_arena_identities(&self.assembly_pool);
+                let cancellation = self.cancellation.clone();
+                let mut frame = interleave_fields_in_pool(
+                    &mut self.assembly_pool,
+                    top,
+                    bottom,
+                    cancellation.as_ref(),
+                    &internal,
+                )?;
                 // §8.2.1 eq. 8-1 — PicOrderCnt(frame) =
                 // Min(TopFieldOrderCnt, BottomFieldOrderCnt).
                 let frame_poc = prev.field_poc.min(field_poc);
@@ -2078,6 +2113,37 @@ impl H264CodecDecoder {
         }
     }
 
+    fn internal_arena_identities(&self, pool: &Arc<ArenaPool>) -> HashSet<ArenaIdentity> {
+        let mut ids = HashSet::new();
+
+        if let Some(in_progress) = self.in_progress.as_ref() {
+            insert_picture_arena_identity(&mut ids, pool, &in_progress.pic);
+        }
+        if let Some(field) = self.pending_field.as_ref() {
+            insert_picture_arena_identity(&mut ids, pool, &field.pic);
+        }
+        for picture in self.ref_store.pictures() {
+            insert_picture_arena_identity(&mut ids, pool, picture);
+        }
+        for entry in self.output_dpb.iter() {
+            insert_lease_arena_identity(&mut ids, pool, &entry.picture);
+        }
+        for lease in &self.ready {
+            insert_lease_arena_identity(&mut ids, pool, lease);
+        }
+        for id in &self.extra_internal_arenas {
+            if pool.owns_identity(*id) {
+                ids.insert(*id);
+            }
+        }
+        ids
+    }
+
+    fn lease_with_backpressure(&self, pool: &Arc<ArenaPool>, purpose: &str) -> Result<Arena> {
+        let internal = self.internal_arena_identities(pool);
+        lease_pool_with_backpressure(pool, self.cancellation.as_ref(), &internal, purpose)
+    }
+
     fn allocate_picture(
         &mut self,
         width_samples: u32,
@@ -2086,8 +2152,9 @@ impl H264CodecDecoder {
         bit_depth_y: u32,
         bit_depth_c: u32,
     ) -> Result<Picture> {
-        Picture::new_in_wait(
-            &self.picture_pool,
+        let arena = self.lease_with_backpressure(&self.picture_pool, "picture")?;
+        Picture::new_in_arena(
+            arena,
             width_samples,
             height_samples,
             chroma_array_type,
@@ -2414,6 +2481,9 @@ impl H264CodecDecoder {
             match ev {
                 Ok(ev) => {
                     if let Err(e) = self.handle_event(ev) {
+                        if e.is_cancelled() || e.is_resource_exhausted() {
+                            return Err(e);
+                        }
                         self.decode_errors += 1;
                         eprintln!("h264 slice skipped: {e}");
                     }
@@ -2480,6 +2550,9 @@ impl Decoder for H264CodecDecoder {
                         .process_nal(&data[i..i + len])
                         .map_err(|e| Error::invalid(format!("h264 NAL parse: {e}")))?;
                     if let Err(e) = self.handle_event(ev) {
+                        if e.is_cancelled() || e.is_resource_exhausted() {
+                            return Err(e);
+                        }
                         self.decode_errors += 1;
                         eprintln!("h264 slice skipped: {e}");
                     }
@@ -2510,6 +2583,15 @@ impl Decoder for H264CodecDecoder {
         self.pop_frame_lease()
     }
 
+    fn set_cancellation_token(&mut self, token: CancellationToken) {
+        self.cancellation = Some(token.clone());
+        if let Some(scp) = self.scp.as_mut() {
+            for sub in scp.subs.iter_mut() {
+                sub.set_cancellation_token(token.clone());
+            }
+        }
+    }
+
     fn flush(&mut self) -> Result<()> {
         if self.length_size.is_none() {
             if let Some(access_unit) = self.au_assembler.flush() {
@@ -2522,6 +2604,9 @@ impl Decoder for H264CodecDecoder {
         // §7.4.1.2 — close any picture we've been assembling so it reaches
         // the DPB + output queue before the caller drains at EOF.
         if let Err(e) = self.finalize_in_progress_picture() {
+            if e.is_cancelled() || e.is_resource_exhausted() {
+                return Err(e);
+            }
             self.decode_errors += 1;
             eprintln!("h264 flush: final picture skipped: {e}");
         }
@@ -2532,8 +2617,9 @@ impl Decoder for H264CodecDecoder {
         // §8.1 — flush the three separate-colour-plane sub-decoders and
         // merge their drained plane pictures into three-plane frames.
         if let Some(scp) = self.scp.as_mut() {
-            for sub in scp.subs.iter_mut() {
-                sub.flush()?;
+            for index in 0..scp.subs.len() {
+                scp.subs[index].extra_internal_arenas = queue_arena_identities(&scp.queues[index]);
+                scp.subs[index].flush()?;
             }
             self.drain_and_merge_scp()?;
         }
@@ -2566,6 +2652,7 @@ impl Decoder for H264CodecDecoder {
         self.picture_pool = ArenaPool::new(H264_PICTURE_POOL_MAX_ARENAS, arena_cap);
         let assembly_cap = self.assembly_pool.cap_per_arena().max(1);
         self.assembly_pool = ArenaPool::new(H264_PICTURE_POOL_MAX_ARENAS, assembly_cap);
+        self.extra_internal_arenas.clear();
         // §8.1 — drop the separate-colour-plane sub-decoders wholesale;
         // a post-reset stream re-creates them at its first SCP slice.
         self.scp = None;
@@ -2619,11 +2706,89 @@ fn ensure_assembly_pool_sized(pool: &mut Arc<ArenaPool>, required: usize) {
     }
 }
 
+fn insert_picture_arena_identity(
+    ids: &mut HashSet<ArenaIdentity>,
+    pool: &Arc<ArenaPool>,
+    picture: &Picture,
+) {
+    let id = picture.arena_identity();
+    if pool.owns_identity(id) {
+        ids.insert(id);
+    }
+}
+
+fn insert_lease_arena_identity(
+    ids: &mut HashSet<ArenaIdentity>,
+    pool: &Arc<ArenaPool>,
+    lease: &FrameLease,
+) {
+    if let Some(frame) = lease.as_arena_video() {
+        let id = frame.arena_identity();
+        if pool.owns_identity(id) {
+            ids.insert(id);
+        }
+    }
+}
+
+fn queue_arena_identities(queue: &VecDeque<FrameLease>) -> HashSet<ArenaIdentity> {
+    queue
+        .iter()
+        .filter_map(FrameLease::as_arena_video)
+        .map(|frame| frame.arena_identity())
+        .collect()
+}
+
+fn lease_pool_with_backpressure(
+    pool: &Arc<ArenaPool>,
+    cancellation: Option<&CancellationToken>,
+    internal_ids: &HashSet<ArenaIdentity>,
+    purpose: &str,
+) -> Result<Arena> {
+    match pool.lease() {
+        Ok(arena) => return Ok(arena),
+        Err(Error::ResourceExhausted(_)) => {}
+        Err(error) => return Err(error),
+    }
+
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(Error::cancelled(format!(
+            "h264 {purpose} arena wait cancelled"
+        )));
+    }
+
+    // `ArenaPool::lease()` only reports exhaustion when every one of its
+    // `max_arenas` slots is checked out. If the decoder itself retains all of
+    // those unique allocations, no other thread can make the wait progress:
+    // the decoder would be sleeping on resources only it can release by
+    // continuing. Reject that state rather than deadlocking indefinitely.
+    let internal = internal_ids
+        .iter()
+        .filter(|id| pool.owns_identity(**id))
+        .count();
+    if internal >= pool.max_arenas() {
+        return Err(Error::resource_exhausted(format!(
+            "h264 {purpose} arena wait would self-deadlock: decoder retains all \
+             {} pool arenas",
+            pool.max_arenas()
+        )));
+    }
+
+    let Some(cancellation) = cancellation else {
+        return Err(Error::resource_exhausted(format!(
+            "h264 {purpose} arena pool exhausted without a cancellation-aware \
+             execution context; refusing an indefinite wait"
+        )));
+    };
+    pool.lease_wait_cancellable(cancellation)
+}
+
 fn merge_separate_colour_planes(
     pool: &mut Arc<ArenaPool>,
     y: &FrameLease,
     cb: &FrameLease,
     cr: &FrameLease,
+    cancellation: Option<&CancellationToken>,
+    internal_ids: &HashSet<ArenaIdentity>,
 ) -> Result<FrameLease> {
     let y = y.as_arena_video().ok_or_else(|| {
         Error::other("h264: separate-colour-plane sub-decoder emitted non-arena luma")
@@ -2686,7 +2851,7 @@ fn merge_separate_colour_planes(
         .ok_or_else(|| Error::resource_exhausted("h264: SCP output arena size overflow"))?
         .max(1);
     ensure_assembly_pool_sized(pool, required);
-    let arena = pool.lease_wait()?;
+    let arena = lease_pool_with_backpressure(pool, cancellation, internal_ids, "SCP assembly")?;
     let mut builder = VideoFrameBuilder::<u8>::new(arena, &lengths, &strides)?;
     builder
         .plane_mut(0)
@@ -2738,7 +2903,7 @@ fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
     .saturating_add(H264_PICTURE_ARENA_PADDING)
     .max(1);
     let mut pool = ArenaPool::new(1, required);
-    interleave_fields_in_pool(&mut pool, top, bottom)
+    interleave_fields_in_pool(&mut pool, top, bottom, None, &HashSet::new())
         .expect("standalone PAFF interleave allocation")
 }
 
@@ -2746,6 +2911,8 @@ fn interleave_fields_in_pool(
     pool: &mut Arc<ArenaPool>,
     top: &Picture,
     bottom: &Picture,
+    cancellation: Option<&CancellationToken>,
+    internal_ids: &HashSet<ArenaIdentity>,
 ) -> Result<Picture> {
     let w = top.width_in_samples;
     let field_h = top.height_in_samples;
@@ -2760,8 +2927,9 @@ fn interleave_fields_in_pool(
     .saturating_add(H264_PICTURE_ARENA_PADDING)
     .max(1);
     ensure_assembly_pool_sized(pool, required);
-    let mut frame = Picture::new_in_wait(
-        pool,
+    let arena = lease_pool_with_backpressure(pool, cancellation, internal_ids, "PAFF assembly")?;
+    let mut frame = Picture::new_in_arena(
+        arena,
         w,
         frame_h,
         top.chroma_array_type,
@@ -4069,7 +4237,7 @@ mod tests {
         let cb = gray_arena_4x2(20, None);
         let cr = gray_arena_4x2(30, None);
         let mut pool = ArenaPool::new(H264_PICTURE_POOL_MAX_ARENAS, 1);
-        let lease = merge_separate_colour_planes(&mut pool, &y, &cb, &cr)
+        let lease = merge_separate_colour_planes(&mut pool, &y, &cb, &cr, None, &HashSet::new())
             .expect("merge separate colour planes");
         let frame = lease
             .as_arena_video()
@@ -4093,6 +4261,7 @@ mod tests {
             Picture::required_bytes(16, 16, 1, 8, 8).saturating_add(H264_PICTURE_ARENA_PADDING);
         let pool = ArenaPool::new(1, required);
         dec.picture_pool = Arc::clone(&pool);
+        dec.set_cancellation_token(CancellationToken::new());
 
         // Model a downstream consumer retaining the only pooled picture.
         let mut first = Picture::new_in(&pool, 16, 16, 1, 8, 8).expect("first pooled picture");
@@ -4117,6 +4286,97 @@ mod tests {
             "decoder allocation should succeed after retained arena returns"
         );
         worker.join().expect("allocation worker");
+    }
+
+    #[test]
+    fn picture_pool_wait_returns_cancelled_when_pipeline_cancels() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let required =
+            Picture::required_bytes(16, 16, 1, 8, 8).saturating_add(H264_PICTURE_ARENA_PADDING);
+        let pool = ArenaPool::new(1, required);
+        dec.picture_pool = Arc::clone(&pool);
+        let cancellation = CancellationToken::new();
+        dec.set_cancellation_token(cancellation.clone());
+
+        let mut first = Picture::new_in(&pool, 16, 16, 1, 8, 8).expect("first pooled picture");
+        let retained = FrameLease::from_arena_video(first.freeze(None).expect("freeze first"));
+        drop(first);
+
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = dec.allocate_picture(16, 16, 1, 8, 8).map(|_| ());
+            tx.send(result).expect("report allocation result");
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "decoder must be waiting before cancellation"
+        );
+        cancellation.cancel();
+        let result = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancellation must wake decoder promptly");
+        assert!(matches!(result, Err(Error::Cancelled(_))));
+
+        // Cancellation does not steal/recycle a still-retained arena.
+        assert_eq!(pool.checked_out_count(), 1);
+        drop(retained);
+        worker.join().expect("allocation worker");
+    }
+
+    #[test]
+    fn picture_pool_detects_decoder_self_deadlock() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let required =
+            Picture::required_bytes(16, 16, 1, 8, 8).saturating_add(H264_PICTURE_ARENA_PADDING);
+        let pool = ArenaPool::new(1, required);
+        dec.picture_pool = Arc::clone(&pool);
+        dec.set_cancellation_token(CancellationToken::new());
+
+        let mut first = dec
+            .allocate_picture(16, 16, 1, 8, 8)
+            .expect("first pooled picture");
+        let retained = first.freeze(None).expect("freeze first");
+        drop(first);
+        dec.ready.push_back(FrameLease::from_arena_video(retained));
+
+        let err = dec
+            .allocate_picture(16, 16, 1, 8, 8)
+            .expect_err("decoder-owned sole slot must not be waited on");
+        assert!(
+            matches!(&err, Error::ResourceExhausted(message) if message.contains("self-deadlock")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn assembly_pool_detects_decoder_self_deadlock() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        let pool = ArenaPool::new(1, 64);
+        dec.assembly_pool = Arc::clone(&pool);
+        dec.set_cancellation_token(CancellationToken::new());
+
+        let arena = pool.lease().expect("assembly arena");
+        let mut builder =
+            VideoFrameBuilder::<u8>::new(arena, &[8], &[4]).expect("assembly builder");
+        builder.plane_mut(0).expect("plane").fill(7);
+        let frame = builder
+            .freeze(FrameHeader::new(4, 2, PixelFormat::Gray8, None))
+            .expect("assembly frame");
+        dec.ready.push_back(FrameLease::from_arena_video(frame));
+
+        let err = match dec.lease_with_backpressure(&dec.assembly_pool, "test assembly") {
+            Ok(_) => panic!("decoder-owned assembly slot must not be waited on"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&err, Error::ResourceExhausted(message) if message.contains("self-deadlock")),
+            "unexpected error: {err}"
+        );
     }
 
     /// Round 430 (2026-07-25 scheduled-fuzz OOM triage) — §8.2.5.2

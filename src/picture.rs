@@ -15,7 +15,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use oxideav_core::arena::sync::{
-    Arena, ArenaPool, Frame as ArenaFrame, FrameHeader, VideoFrameBuilder,
+    Arena, ArenaIdentity, ArenaPool, Frame as ArenaFrame, FrameHeader, VideoFrameBuilder,
 };
 use oxideav_core::{PixelFormat, Result};
 
@@ -230,10 +230,10 @@ impl Picture {
     /// Allocate reconstruction planes from a reusable arena pool, waiting for
     /// an existing retained frame to release a slot when the pool is full.
     ///
-    /// The software streaming decoder uses this path so temporary downstream
-    /// back-pressure does not turn into a codec error and corrupt its picture
-    /// state. The wait is fulfilled by [`ArenaPool`] when any arena from this
-    /// pool is returned.
+    /// This uncancellable compatibility path is useful to callers with an
+    /// independent guaranteed progress mechanism. The H.264 streaming decoder
+    /// itself pre-leases through its cancellation/deadlock-aware allocator and
+    /// then calls [`Self::new_in_arena`].
     pub fn new_in_wait(
         pool: &Arc<ArenaPool>,
         width_in_samples: u32,
@@ -252,7 +252,7 @@ impl Picture {
         )
     }
 
-    fn new_in_arena(
+    pub(crate) fn new_in_arena(
         arena: Arena,
         width_in_samples: u32,
         height_in_samples: u32,
@@ -319,6 +319,14 @@ impl Picture {
 
     pub fn is_frozen(&self) -> bool {
         matches!(self.storage, Some(PictureStorage::Frozen(_)))
+    }
+
+    pub(crate) fn arena_identity(&self) -> ArenaIdentity {
+        match self.storage.as_ref().expect("picture storage") {
+            PictureStorage::Writable8(builder) => builder.arena_identity(),
+            PictureStorage::Writable16(builder) => builder.arena_identity(),
+            PictureStorage::Frozen(frame) => frame.arena_identity(),
+        }
     }
 
     fn sample_plane(&self, plane: usize) -> SamplePlane<'_> {

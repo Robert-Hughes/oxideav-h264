@@ -173,6 +173,10 @@ impl RefPicStore {
         self.pictures.len()
     }
 
+    pub(crate) fn pictures(&self) -> impl Iterator<Item = &Picture> {
+        self.pictures.values()
+    }
+
     /// Replace the RefPicList0 key array.
     pub fn set_list_0(&mut self, keys: Vec<u32>) {
         self.ref_pic_list_0 = keys;
