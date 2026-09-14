@@ -403,7 +403,7 @@ impl<'a> CabacDecoder<'a> {
         self.renorm_d()?;
         self.bin_count = self.bin_count.wrapping_add(1);
         if trace_on {
-            eprintln!(
+            log::info!(
                 "[BIN {:>8}] DD pre_state={:>2} pre_mps={} pre_range={:>4} pre_offset={:>4} bin={} post_state={:>2} post_mps={} post_range={:>4} post_offset={:>4}",
                 self.bin_count,
                 pre_state, pre_mps, pre_range, pre_offset,
@@ -437,7 +437,7 @@ impl<'a> CabacDecoder<'a> {
         };
         self.bin_count = self.bin_count.wrapping_add(1);
         if trace_on {
-            eprintln!(
+            log::info!(
                 "[BIN {:>8}] BP pre_range={:>4} pre_offset={:>4} bin={} post_range={:>4} post_offset={:>4}",
                 self.bin_count,
                 pre_range, pre_offset,
@@ -474,7 +474,7 @@ impl<'a> CabacDecoder<'a> {
         };
         self.bin_count = self.bin_count.wrapping_add(1);
         if trace_on {
-            eprintln!(
+            log::info!(
                 "[BIN {:>8}] TT pre_range={:>4} pre_offset={:>4} bin={} post_range={:>4} post_offset={:>4}",
                 self.bin_count,
                 pre_range, pre_offset,

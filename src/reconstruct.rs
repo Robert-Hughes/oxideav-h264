@@ -2234,7 +2234,7 @@ fn reconstruct_intra_nxn(
         let debug_mb = recon_debug_mb_target();
         let debug = (mb_addr == 0 && recon_debug_enabled()) || debug_mb == Some(mb_addr);
         if debug {
-            eprintln!(
+            log::info!(
                 "RECON MB{} I_NxN: cbp_luma={:#x} qp_y={} mb_type_raw={} cbp={:#x} entropy={}",
                 mb_addr,
                 cbp_luma,
@@ -2247,15 +2247,15 @@ fn reconstruct_intra_nxn(
                     "CAVLC"
                 }
             );
-            eprintln!("  prev_flags: {:?}", pred.prev_intra4x4_pred_mode_flag);
-            eprintln!("  rem_modes:  {:?}", pred.rem_intra4x4_pred_mode);
-            eprintln!("  residual_luma.len() = {}", mb.residual_luma.len());
+            log::info!("  prev_flags: {:?}", pred.prev_intra4x4_pred_mode_flag);
+            log::info!("  rem_modes:  {:?}", pred.rem_intra4x4_pred_mode);
+            log::info!("  residual_luma.len() = {}", mb.residual_luma.len());
             for (i, blk) in mb.residual_luma.iter().enumerate() {
                 let nz = blk.iter().filter(|&&v| v != 0).count();
                 if nz > 0 {
-                    eprintln!("  residual_luma[{}] ({} nz): {:?}", i, nz, blk);
+                    log::info!("  residual_luma[{}] ({} nz): {:?}", i, nz, blk);
                 } else {
-                    eprintln!("  residual_luma[{}] (all zero)", i);
+                    log::info!("  residual_luma[{}] (all zero)", i);
                 }
             }
         }
@@ -2326,7 +2326,7 @@ fn reconstruct_intra_nxn(
             };
 
             if debug && (block_idx == 0 || block_idx == 3) {
-                eprintln!(
+                log::info!(
                     "  blk{}: pred_mode={} samples.avail=tl{}t{}tr{}l{}",
                     block_idx,
                     mode.as_index(),
@@ -2335,11 +2335,11 @@ fn reconstruct_intra_nxn(
                     samples.availability.top_right,
                     samples.availability.left
                 );
-                eprintln!("    top: {:?}, left: {:?}", samples.top, samples.left);
-                eprintln!("    pred_samples: {:?}", pred_samples);
-                eprintln!("    coeffs_scan: {:?}", coeffs_scan);
-                eprintln!("    coeffs(4x4): {:?}", coeffs);
-                eprintln!("    residual: {:?}", residual);
+                log::info!("    top: {:?}, left: {:?}", samples.top, samples.left);
+                log::info!("    pred_samples: {:?}", pred_samples);
+                log::info!("    coeffs_scan: {:?}", coeffs_scan);
+                log::info!("    coeffs(4x4): {:?}", coeffs);
+                log::info!("    residual: {:?}", residual);
             }
 
             // Combine + clip + write. For the §8.6.2 SI path the
@@ -4325,7 +4325,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     let inter_debug_mb = recon_debug_mb_target();
     let inter_debug = (mb_addr == 0 && recon_debug_enabled()) || inter_debug_mb == Some(mb_addr);
     if inter_debug {
-        eprintln!(
+        log::info!(
             "RECON_INTER MB#{} mb_type={:?} mb_type_raw={} slice_type={:?} \
              cbp={:#x} transform8x8={} qp_y={} partitions={}",
             mb_addr,
@@ -4338,7 +4338,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             partitions.len(),
         );
         for (i, p) in partitions.iter().enumerate() {
-            eprintln!(
+            log::info!(
                 "  part[{}] x={} y={} w={} h={} mode={:?} shape={:?} \
                  ref_l0={} ref_l1={} mvd_l0={:?} mvd_l1={:?}",
                 i,
@@ -4536,7 +4536,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
                 inverse_transform_4x4(&coeffs, qp_prime_y, &sl4, bit_depth_y)?
             };
             if inter_debug {
-                eprintln!(
+                log::info!(
                     "    RES blk4={blk4} has_res={has_res} qp'={qp_prime_y} res={:?}",
                     residual
                 );
@@ -4818,7 +4818,7 @@ fn process_partition<R: RefPicProvider>(
                  // Everything else uses mvLX = mvpLX + mvdLX (eq. 8-174-ish in §8.4.1).
     let (mv_l0, mv_l1) = derive_partition_mvs(part, mb_addr, grid, current_slice_id);
     if inter_debug {
-        eprintln!(
+        log::info!(
             "    derived mv_l0={:?} mv_l1={:?} for part@({},{} {}x{})",
             (mv_l0.x, mv_l0.y),
             (mv_l1.x, mv_l1.y),
@@ -4989,7 +4989,7 @@ fn process_partition<R: RefPicProvider>(
     if has_l0 {
         let (rp, fld) = resolve_ref(0, part.ref_idx_l0)?;
         if inter_debug {
-            eprintln!(
+            log::info!(
                 "    L0 ref idx={} pic {}x{} poc={} fld={:?} ysum0={}",
                 part.ref_idx_l0,
                 rp.width_in_samples,
@@ -5016,7 +5016,7 @@ fn process_partition<R: RefPicProvider>(
     if has_l1 {
         let (rp, fld) = resolve_ref(1, part.ref_idx_l1)?;
         if inter_debug {
-            eprintln!(
+            log::info!(
                 "    L1 ref idx={} pic {}x{} poc={} fld={:?} ysum0={}",
                 part.ref_idx_l1,
                 rp.width_in_samples,
@@ -5040,7 +5040,7 @@ fn process_partition<R: RefPicProvider>(
             fld,
         )?;
         if inter_debug {
-            eprintln!(
+            log::info!(
                 "    L1 buf abs=({part_abs_x},{part_abs_y}) mv={:?} row sums: {:?}",
                 (mv_l1.x, mv_l1.y),
                 (0..h as usize)
@@ -9915,7 +9915,7 @@ fn deblock_plane_chroma(
                                 both_in_frame_mbs,
                             });
                             if deblock_trace_enabled() {
-                                eprintln!(
+                                log::info!(
                                     "DBL C{} Vx={edge_x} y0={y0} bs={bs} plane={plane} p_addr={p_addr} q_addr={q_addr} p_is_intra={} q_is_intra={} p_nz={} q_nz={} diff_ref_mv={}",
                                     plane,
                                     p_info.is_intra,

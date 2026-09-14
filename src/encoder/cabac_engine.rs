@@ -143,7 +143,7 @@ impl CabacEncoder {
         self.renorm_e();
         self.bin_count = self.bin_count.wrapping_add(1);
         if trace_on {
-            eprintln!(
+            log::info!(
                 "[ENC {:>8}] DD pre_state={:>2} pre_mps={} pre_range={:>4} pre_low={:>4} bin={} post_state={:>2} post_mps={} post_range={:>4} post_low={:>4}",
                 self.bin_count,
                 pre_state, pre_mps, pre_range, pre_low,
@@ -180,7 +180,7 @@ impl CabacEncoder {
         }
         self.bin_count = self.bin_count.wrapping_add(1);
         if trace_on {
-            eprintln!(
+            log::info!(
                 "[ENC {:>8}] BP pre_range={:>4} pre_low={:>4} bin={} post_range={:>4} post_low={:>4}",
                 self.bin_count,
                 pre_range, pre_low,
@@ -211,7 +211,7 @@ impl CabacEncoder {
         }
         self.bin_count = self.bin_count.wrapping_add(1);
         if trace_on {
-            eprintln!(
+            log::info!(
                 "[ENC {:>8}] TT pre_range={:>4} pre_low={:>4} bin={} post_range={:>4} post_low={:>4}",
                 self.bin_count,
                 pre_range, pre_low,

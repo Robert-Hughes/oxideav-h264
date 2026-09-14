@@ -21,6 +21,7 @@ default = []
 nightly = []
 
 [dependencies]
+log = "0.4"
 oxideav-core = "0.1"
 thiserror = "2"
 

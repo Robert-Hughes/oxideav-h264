@@ -2485,7 +2485,7 @@ impl H264CodecDecoder {
                             return Err(e);
                         }
                         self.decode_errors += 1;
-                        eprintln!("h264 slice skipped: {e}");
+                        log::warn!("h264 slice skipped: {e}");
                     }
                 }
                 Err(e) => return Err(Error::invalid(format!("h264 NAL parse: {e}"))),
@@ -2554,7 +2554,7 @@ impl Decoder for H264CodecDecoder {
                             return Err(e);
                         }
                         self.decode_errors += 1;
-                        eprintln!("h264 slice skipped: {e}");
+                        log::warn!("h264 slice skipped: {e}");
                     }
                     i += len;
                 }
@@ -2608,7 +2608,7 @@ impl Decoder for H264CodecDecoder {
                 return Err(e);
             }
             self.decode_errors += 1;
-            eprintln!("h264 flush: final picture skipped: {e}");
+            log::warn!("h264 flush: final picture skipped: {e}");
         }
         // §C.4.4 — a trailing unpaired PAFF field at EOF can never gain a
         // complementary partner; emit it as a standalone half-height

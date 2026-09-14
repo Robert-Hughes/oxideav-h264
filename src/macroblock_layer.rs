@@ -2607,9 +2607,15 @@ pub fn parse_macroblock_dp(
         } else {
             (-1, -1, -1)
         };
-        eprintln!(
+        log::info!(
             "[MB {:>4}] enter cursor=({},{}) cabac=({},{}) bins={} slice_type={:?}",
-            mb_addr_dbg, b, bi, cb, cbi, bins, slice_type
+            mb_addr_dbg,
+            b,
+            bi,
+            cb,
+            cbi,
+            bins,
+            slice_type
         );
     }
 
@@ -2639,7 +2645,7 @@ pub fn parse_macroblock_dp(
             SliceType::B => decode_mb_type_b(dec, ctxs, &entropy.neighbours)?,
         };
         if dbg_mb_enter_on || dbg_mb_type_all {
-            eprintln!(
+            log::info!(
                 "[MBTYPE {}] raw={} bins_consumed={} slice={:?}",
                 entropy.current_mb_addr,
                 v,
@@ -2653,9 +2659,12 @@ pub fn parse_macroblock_dp(
     };
     if dbg {
         let (b, bi) = r.position();
-        eprintln!(
+        log::info!(
             "[MB {:>4}]   after mb_type raw={} cursor=({},{})",
-            mb_addr_dbg, mb_type_raw, b, bi
+            mb_addr_dbg,
+            mb_type_raw,
+            b,
+            bi
         );
     }
 
@@ -2809,9 +2818,12 @@ pub fn parse_macroblock_dp(
     }
     if dbg {
         let (b, bi) = r.position();
-        eprintln!(
+        log::info!(
             "[MB {:>4}]   after mb_pred/sub_mb_pred mb_type={:?} cursor=({},{})",
-            mb_addr_dbg, mb_type, b, bi
+            mb_addr_dbg,
+            mb_type,
+            b,
+            bi
         );
     }
 
@@ -2835,7 +2847,7 @@ pub fn parse_macroblock_dp(
                 entropy.chroma_array_type,
             )?;
             if dbg {
-                eprintln!(
+                log::info!(
                     "[MB {:>4}]   CBP bins_consumed={} value={}",
                     mb_addr_dbg,
                     dec.bin_count() - bb,
@@ -2851,9 +2863,14 @@ pub fn parse_macroblock_dp(
     }
     if dbg {
         let (b, bi) = r.position();
-        eprintln!(
+        log::info!(
             "[MB {:>4}]   after CBP total={} luma={} chroma={} cursor=({},{})",
-            mb_addr_dbg, cbp_total, cbp_luma, cbp_chroma, b, bi
+            mb_addr_dbg,
+            cbp_total,
+            cbp_luma,
+            cbp_chroma,
+            b,
+            bi
         );
     }
 
@@ -2916,7 +2933,7 @@ pub fn parse_macroblock_dp(
             let v = decode_mb_qp_delta(dec, ctxs, entropy.prev_mb_qp_delta_nonzero)?;
             let bins_after = dec.bin_count();
             if dbg {
-                eprintln!(
+                log::info!(
                     "[MB {:>4}]   mb_qp_delta decode: prev_nz={} bins_consumed={} value={}",
                     mb_addr_dbg,
                     entropy.prev_mb_qp_delta_nonzero,
@@ -2934,9 +2951,13 @@ pub fn parse_macroblock_dp(
     entropy.prev_mb_qp_delta_nonzero = mb_qp_delta != 0;
     if dbg {
         let (b, bi) = r.position();
-        eprintln!(
+        log::info!(
             "[MB {:>4}]   after mb_qp_delta={} t8x8_flag={} cursor=({},{})",
-            mb_addr_dbg, mb_qp_delta, transform_size_8x8_flag, b, bi
+            mb_addr_dbg,
+            mb_qp_delta,
+            transform_size_8x8_flag,
+            b,
+            bi
         );
     }
 
@@ -3238,9 +3259,11 @@ fn parse_mb_pred(
                     r.te(x_l0)?
                 };
                 if dbg_on {
-                    eprintln!(
+                    log::info!(
                         "[MBP {}] ref_idx_l0 part={} gated=true val={}",
-                        entropy.current_mb_addr, part, v
+                        entropy.current_mb_addr,
+                        part,
+                        v
                     );
                 }
                 // Record per-8x8-partition value covering this mb part.
@@ -3314,7 +3337,7 @@ fn parse_mb_pred(
                     let my = decode_mvd_lx(dec, ctxs, MvdComponent::Y, sum_y)?;
                     let mb_y = dec.bin_count();
                     if dbg_on {
-                        eprintln!("[MBP {}] mvd_l0 part={} blk4={} sum_x={} sum_y={} mx={} (bins={}) my={} (bins={})",
+                        log::info!("[MBP {}] mvd_l0 part={} blk4={} sum_x={} sum_y={} mx={} (bins={}) my={} (bins={})",
                                  entropy.current_mb_addr, part, blk4, sum_x, sum_y,
                                  mx, mb_x - bb_mvd, my, mb_y - mb_x);
                     }
@@ -3533,9 +3556,12 @@ fn parse_sub_mb_pred(
             SubMbType::from_p(raw)?
         };
         if dbg_on {
-            eprintln!(
+            log::info!(
                 "[SUB {}] sub_mb_type[{}] raw={} -> {:?}",
-                entropy.current_mb_addr, i, raw, out.sub_mb_type[i]
+                entropy.current_mb_addr,
+                i,
+                raw,
+                out.sub_mb_type[i]
             );
         }
     }
@@ -3632,42 +3658,43 @@ fn parse_sub_mb_pred(
         if !is_direct_sub && mode != Some(MbPartPredMode::PredL1) {
             let n = sub.num_sub_mb_part() as usize;
             for sp in 0..n {
-                let (mx, my) = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
-                    let blk4 = sub_mb_sub_part_4x4(i, sp, sub);
-                    let sum_x = neighbour_mvd_abs_sum(
-                        entropy.cabac_nb.as_deref(),
-                        entropy.current_mb_addr,
-                        &curr_nb,
-                        0,
-                        MvdComponent::X,
-                        blk4,
-                    );
-                    let sum_y = neighbour_mvd_abs_sum(
-                        entropy.cabac_nb.as_deref(),
-                        entropy.current_mb_addr,
-                        &curr_nb,
-                        0,
-                        MvdComponent::Y,
-                        blk4,
-                    );
-                    let mx = decode_mvd_lx(dec, ctxs, MvdComponent::X, sum_x)?;
-                    let my = decode_mvd_lx(dec, ctxs, MvdComponent::Y, sum_y)?;
-                    if dbg_on {
-                        eprintln!(
+                let (mx, my) =
+                    if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
+                        let blk4 = sub_mb_sub_part_4x4(i, sp, sub);
+                        let sum_x = neighbour_mvd_abs_sum(
+                            entropy.cabac_nb.as_deref(),
+                            entropy.current_mb_addr,
+                            &curr_nb,
+                            0,
+                            MvdComponent::X,
+                            blk4,
+                        );
+                        let sum_y = neighbour_mvd_abs_sum(
+                            entropy.cabac_nb.as_deref(),
+                            entropy.current_mb_addr,
+                            &curr_nb,
+                            0,
+                            MvdComponent::Y,
+                            blk4,
+                        );
+                        let mx = decode_mvd_lx(dec, ctxs, MvdComponent::X, sum_x)?;
+                        let my = decode_mvd_lx(dec, ctxs, MvdComponent::Y, sum_y)?;
+                        if dbg_on {
+                            log::info!(
                             "[SUB {}] mvd_l0 blk8={} sp={} blk4={} sum_x={} sum_y={} mx={} my={}",
                             entropy.current_mb_addr, i, sp, blk4, sum_x, sum_y, mx, my
                         );
-                    }
-                    for b4 in sub_mb_sub_part_4x4_range(i, sp, sub) {
-                        curr_nb.mvd_l0_x[b4 as usize] =
-                            mx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                        curr_nb.mvd_l0_y[b4 as usize] =
-                            my.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                    }
-                    (mx, my)
-                } else {
-                    (r.se()?, r.se()?)
-                };
+                        }
+                        for b4 in sub_mb_sub_part_4x4_range(i, sp, sub) {
+                            curr_nb.mvd_l0_x[b4 as usize] =
+                                mx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                            curr_nb.mvd_l0_y[b4 as usize] =
+                                my.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        }
+                        (mx, my)
+                    } else {
+                        (r.se()?, r.se()?)
+                    };
                 out.mvd_l0[i].push([mx, my]);
             }
         }
@@ -4089,9 +4116,13 @@ fn parse_residual_cavlc_only(
                     let nc = derive_luma(blk_idx, LumaNcKind::Ac, &own_luma_totals, grid_ref);
                     if dbg {
                         let (b, bi) = r.position();
-                        eprintln!(
+                        log::info!(
                             "[MB {:>4}]   luma4x4 blk={} nc={} cursor=({},{})",
-                            current_mb_addr, blk_idx, nc, b, bi
+                            current_mb_addr,
+                            blk_idx,
+                            nc,
+                            b,
+                            bi
                         );
                     }
                     let blk =
@@ -4119,27 +4150,33 @@ fn parse_residual_cavlc_only(
             let max_dc = if chroma_array_type == 1 { 4 } else { 8 };
             if dbg {
                 let (b, bi) = r.position();
-                eprintln!(
+                log::info!(
                     "[MB {:>4}]   chromaDc cb cursor=({},{})",
-                    current_mb_addr, b, bi
+                    current_mb_addr,
+                    b,
+                    bi
                 );
             }
             let cb_dc = parse_residual_block_cavlc(r, dc_ctx, 0, max_dc - 1, max_dc)?;
             out.residual_chroma_dc_cb = cb_dc;
             if dbg {
                 let (b, bi) = r.position();
-                eprintln!(
+                log::info!(
                     "[MB {:>4}]   chromaDc cr cursor=({},{})",
-                    current_mb_addr, b, bi
+                    current_mb_addr,
+                    b,
+                    bi
                 );
             }
             let cr_dc = parse_residual_block_cavlc(r, dc_ctx, 0, max_dc - 1, max_dc)?;
             out.residual_chroma_dc_cr = cr_dc;
             if dbg {
                 let (b, bi) = r.position();
-                eprintln!(
+                log::info!(
                     "[MB {:>4}]   chromaDc done cursor=({},{})",
-                    current_mb_addr, b, bi
+                    current_mb_addr,
+                    b,
+                    bi
                 );
             }
         }
@@ -4148,9 +4185,11 @@ fn parse_residual_cavlc_only(
         if cbp_chroma == 2 {
             if dbg {
                 let (b, bi) = r.position();
-                eprintln!(
+                log::info!(
                     "[MB {:>4}]   chromaAc start cursor=({},{})",
-                    current_mb_addr, b, bi
+                    current_mb_addr,
+                    b,
+                    bi
                 );
             }
             // Cb plane.

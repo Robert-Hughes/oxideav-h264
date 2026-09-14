@@ -52,7 +52,7 @@ fn ctx17_trace_enabled() -> bool {
 #[inline]
 fn dbg_emit(syntax: &str, bins_used: u64, extra: &str) {
     if dbg_enabled() {
-        eprintln!("[CABAC] {syntax} bins={bins_used} {extra}");
+        log::info!("[CABAC] {syntax} bins={bins_used} {extra}");
     }
 }
 
@@ -2468,7 +2468,7 @@ pub fn decode_mb_type_p(
         let c15 = ctxs.at(15);
         let c16 = ctxs.at(16);
         let c17 = ctxs.at(17);
-        eprintln!(
+        log::info!(
             "[CTX17] pre mb_type_p: c14=({},{}) c15=({},{}) c16=({},{}) c17=({},{})",
             c14.state_idx,
             c14.val_mps,
@@ -3033,7 +3033,7 @@ pub fn decode_coded_block_flag(
     let ctx_idx = (base + cat_offset + inc) as usize;
     let bin = dec.decode_decision(ctxs.at_mut(ctx_idx))?;
     if dbg_enabled() {
-        eprintln!(
+        log::info!(
             "[CABAC] cbf bt={:?} base={} cat={} inc={} ctx={} -> {}  cond_left={:?} cond_above={:?}",
             block_type, base, cat_offset, inc, ctx_idx, bin,
             neighbour_cbf_left, neighbour_cbf_above
@@ -3549,9 +3549,12 @@ pub fn decode_end_of_slice_flag(dec: &mut CabacDecoder<'_>) -> CabacResult<bool>
     let (b, bi) = dec.position();
     let v = dec.decode_terminate()?;
     if dbg_enabled() {
-        eprintln!(
+        log::info!(
             "[CABAC] end_of_slice_flag pre_bins={} pre_pos=({},{}) -> {}",
-            before_bins, b, bi, v
+            before_bins,
+            b,
+            bi,
+            v
         );
     }
     Ok(v == 1)

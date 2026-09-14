@@ -1416,7 +1416,7 @@ pub fn encode_residual_block_cabac_field(
     if !any_nz {
         if std::env::var_os("OXIDEAV_H264_CABAC_DEBUG").is_some() {
             let bin_after = enc.bin_count();
-            eprintln!(
+            log::info!(
                 "[ENC-CABAC] block_type={:?} max={} bins={} cbf=false",
                 block_type,
                 max_num_coeff,
@@ -1486,7 +1486,7 @@ pub fn encode_residual_block_cabac_field(
     }
     let bin_after = enc.bin_count();
     if std::env::var_os("OXIDEAV_H264_CABAC_DEBUG").is_some() {
-        eprintln!(
+        log::info!(
             "[ENC-CABAC] block_type={:?} max={} bins={} cbf=true coeffs={:?}",
             block_type,
             max_num_coeff,

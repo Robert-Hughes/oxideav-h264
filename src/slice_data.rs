@@ -289,7 +289,7 @@ fn parse_slice_data_impl(
         )?;
         if std::env::var_os("OXIDEAV_H264_CTX17_TRACE").is_some() {
             let c17 = ctxs.at(17);
-            eprintln!("[CTX17] slice init: kind={:?} init_idc={} qp_y={} num_ref_l0_active_minus1={} c17=({},{})",
+            log::info!("[CTX17] slice init: kind={:?} init_idc={} qp_y={} num_ref_l0_active_minus1={} c17=({},{})",
                 kind, slice_header.cabac_init_idc, slice_qp_y,
                 slice_header.num_ref_idx_l0_active_minus1,
                 c17.state_idx, c17.val_mps);
@@ -318,7 +318,7 @@ fn parse_slice_data_impl(
             if std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some() {
                 let (bp_byte, bp_bit) = cabac_dec.position();
                 let bit_pos = bp_byte * 8 + bp_bit as usize;
-                eprintln!(
+                log::info!(
                     "[MB-BOUNDARY] curr_mb_addr={} bin_count={} range={} offset={} bit_pos={}",
                     curr_mb_addr,
                     cabac_dec.bin_count(),
@@ -378,7 +378,7 @@ fn parse_slice_data_impl(
                 // cross-referencing against an external reference trace.
                 // Useful when chasing CABAC state divergences at specific MBs.
                 if std::env::var_os("OXIDEAV_H264_SKIP_TRACE").is_some() {
-                    eprintln!(
+                    log::info!(
                         "[SKIP {}] flag={} avail_L={} skip_L={} avail_A={} skip_A={}",
                         curr_mb_addr,
                         mb_skip_flag,
