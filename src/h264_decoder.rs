@@ -46,11 +46,11 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use oxideav_core::arena::sync::{Arena, ArenaIdentity, ArenaPool, FrameHeader, VideoFrameBuilder};
 use oxideav_core::Decoder;
+use oxideav_core::arena::sync::{Arena, ArenaIdentity, ArenaPool, FrameHeader, VideoFrameBuilder};
 use oxideav_core::{
     CancellationToken, CodecId, CodecParameters, Error, Frame, FrameLease, Packet, PixelFormat,
-    Result, TimeBase,
+    Result, TimeBase, VideoColorInfo, VideoColorRange, VideoMatrixCoefficients,
 };
 
 use crate::access_unit::AnnexBAccessUnitAssembler;
@@ -64,6 +64,7 @@ use crate::ref_list::{self, DpbEntry, PicStructure, RplmOp};
 use crate::ref_store::{RefPicProvider, RefPicStore};
 use crate::slice_header::{RefPicListModificationOp as SliceRplmOp, SliceHeader, SliceType};
 use crate::sps::Sps;
+use crate::vui::VideoSignalType;
 use crate::{reconstruct, slice_data};
 
 #[cfg(test)]
@@ -211,6 +212,7 @@ impl ScpState {
 /// wants a decoder for H.264.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let mut dec = H264CodecDecoder::new(params.codec_id.clone());
+    dec.output_params = params.clone();
     if !params.extradata.is_empty() {
         dec.consume_extradata(&params.extradata)?;
     }
@@ -239,6 +241,8 @@ const H264_PICTURE_ARENA_PADDING: usize = 3 * 64;
 
 pub struct H264CodecDecoder {
     codec_id: CodecId,
+    /// Decoder-discovered stream metadata published through `output_params()`.
+    output_params: CodecParameters,
     /// NAL unit length-prefix size from `avcC`, when present. `None`
     /// means the input is treated as Annex B byte-stream.
     length_size: Option<u8>,
@@ -339,6 +343,50 @@ pub struct H264CodecDecoder {
     avcc_bit_depth_chroma: Option<u8>,
 }
 
+fn video_color_from_signal(signal: &VideoSignalType) -> VideoColorInfo {
+    let (matrix, colour_primaries, transfer_characteristics) = signal
+        .colour_description
+        .as_ref()
+        .map_or((None, None, None), |description| {
+            let matrix = match description.matrix_coefficients {
+                0 => VideoMatrixCoefficients::Identity,
+                1 => VideoMatrixCoefficients::Bt709,
+                2 => VideoMatrixCoefficients::Unspecified,
+                4 => VideoMatrixCoefficients::Fcc,
+                5 => VideoMatrixCoefficients::Bt470Bg,
+                6 => VideoMatrixCoefficients::Smpte170M,
+                7 => VideoMatrixCoefficients::Smpte240M,
+                8 => VideoMatrixCoefficients::Ycgco,
+                9 => VideoMatrixCoefficients::Bt2020Ncl,
+                10 => VideoMatrixCoefficients::Bt2020Cl,
+                value => VideoMatrixCoefficients::Unknown(value),
+            };
+            (
+                Some(matrix),
+                Some(description.colour_primaries),
+                Some(description.transfer_characteristics),
+            )
+        });
+    VideoColorInfo {
+        range: Some(if signal.video_full_range_flag {
+            VideoColorRange::Full
+        } else {
+            VideoColorRange::Limited
+        }),
+        matrix,
+        colour_primaries,
+        transfer_characteristics,
+    }
+}
+
+fn video_color_from_sps(sps: &Sps) -> Option<VideoColorInfo> {
+    sps.vui
+        .as_ref()?
+        .video_signal_type
+        .as_ref()
+        .map(video_color_from_signal)
+}
+
 impl H264CodecDecoder {
     pub fn new(codec_id: CodecId) -> Self {
         // Start with a "generous" placeholder sizing (16 frames, the
@@ -346,6 +394,7 @@ impl H264CodecDecoder {
         // first slice updates the sizing in `ensure_output_dpb_sized`
         // from the active SPS.
         Self {
+            output_params: CodecParameters::video(codec_id.clone()),
             codec_id,
             length_size: None,
             driver: H264Driver::new(),
@@ -621,6 +670,10 @@ impl H264CodecDecoder {
             self.flush_pending_dp_slice()?;
         }
         match ev {
+            Event::SpsStored(id) => {
+                self.output_params.video_color = self.driver.sps(id).and_then(video_color_from_sps);
+                Ok(())
+            }
             Event::Slice {
                 nal_unit_type,
                 nal_ref_idc,
@@ -2521,6 +2574,10 @@ impl H264CodecDecoder {
 impl Decoder for H264CodecDecoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
+    }
+
+    fn output_params(&self) -> Option<&CodecParameters> {
+        Some(&self.output_params)
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
@@ -4496,5 +4553,43 @@ mod tests {
         assert_eq!(second.synthetic_references.len(), 3);
         let second_nums: Vec<u32> = second.references.iter().map(|e| e.frame_num).collect();
         assert_eq!(second_nums, vec![40_007, 40_008, 40_009]);
+    }
+
+    #[test]
+    fn video_signal_maps_full_range_bt709_metadata() {
+        use crate::vui::{ColourDescription, VideoSignalType};
+
+        let info = video_color_from_signal(&VideoSignalType {
+            video_format: 5,
+            video_full_range_flag: true,
+            colour_description: Some(ColourDescription {
+                colour_primaries: 1,
+                transfer_characteristics: 1,
+                matrix_coefficients: 1,
+            }),
+        });
+        assert_eq!(info.range, Some(VideoColorRange::Full));
+        assert_eq!(info.matrix, Some(VideoMatrixCoefficients::Bt709));
+        assert_eq!(info.colour_primaries, Some(1));
+        assert_eq!(info.transfer_characteristics, Some(1));
+    }
+
+    #[test]
+    fn video_signal_maps_limited_bt601_metadata() {
+        use crate::vui::{ColourDescription, VideoSignalType};
+
+        let info = video_color_from_signal(&VideoSignalType {
+            video_format: 5,
+            video_full_range_flag: false,
+            colour_description: Some(ColourDescription {
+                colour_primaries: 6,
+                transfer_characteristics: 6,
+                matrix_coefficients: 6,
+            }),
+        });
+        assert_eq!(info.range, Some(VideoColorRange::Limited));
+        assert_eq!(info.matrix, Some(VideoMatrixCoefficients::Smpte170M));
+        assert_eq!(info.colour_primaries, Some(6));
+        assert_eq!(info.transfer_characteristics, Some(6));
     }
 }
